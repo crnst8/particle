@@ -1,0 +1,30 @@
+[
+  {
+    "url": "https://github.com/crnst8/particle",
+    "canonical_url": "https://github.com/crnst8/particle",
+    "title": "Welcome to the particle demo",
+    "byline": "Current State Projects",
+    "site_name": "particle",
+    "excerpt": "This library belongs to your browser. The demo server extracts pages but stores nothing.",
+    "content_html": "<p>This is particle: paste a URL, keep the useful part, and read it without the surrounding machinery.</p><p>In this demo, your library, favourites, archive state and reading progress live in this browser's local storage. The server receives an extraction request and returns article JSON; it does not create an account or database.</p><p>Run your own copy to keep the library in one SQLite file you control.</p>",
+    "text_content": "This is particle. In this demo your library, favourites, archive state and reading progress live in this browser. Run your own copy to keep the library in one SQLite file you control.",
+    "word_count": 62,
+    "tags": ["particle", "self-hosted"],
+    "quality": "full",
+    "fetch_method": "demo-fallback"
+  },
+  {
+    "url": "https://github.com/mozilla/readability",
+    "canonical_url": "https://github.com/mozilla/readability",
+    "title": "What happens when you save a page",
+    "byline": "Current State Projects",
+    "site_name": "particle",
+    "excerpt": "particle fetches the page, runs Mozilla Readability, sanitises the result and keeps the article structure.",
+    "content_html": "<p>Saving starts with the URL you paste. particle checks that the destination is a public web address, follows a small number of validated redirects, and fetches the page.</p><p>Mozilla Readability identifies the article. DOMPurify removes unsafe markup. Images are loaded through a size-limited proxy so referer-protected sources still work.</p><p>If the first attempt looks truncated, particle can try alternate page representations before keeping the best result.</p>",
+    "text_content": "particle checks the destination, fetches the page, extracts it with Mozilla Readability, sanitises the result with DOMPurify and keeps the best result.",
+    "word_count": 67,
+    "tags": ["readability", "privacy"],
+    "quality": "full",
+    "fetch_method": "demo-fallback"
+  }
+]

@@ -1,0 +1,8 @@
+node_modules/
+data/
+.dev/
+.env
+.DS_Store
+
+# Drop-in UI font (see public/style.css) — never commit licensed font files.
+public/fonts/

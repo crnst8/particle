@@ -1,0 +1,4 @@
+# Extracted at demo startup. Article content is never bundled in the image.
+https://simple.wikipedia.org/wiki/Reading
+https://simple.wikipedia.org/wiki/Book
+https://simple.wikipedia.org/wiki/World_Wide_Web

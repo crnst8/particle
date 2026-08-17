@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en" data-base="__PARTICLE_BASE__" data-demo="__PARTICLE_DEMO__" data-demo-max="__PARTICLE_DEMO_MAX__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>particle</title>
+<meta name="description" content="Save articles. Read them well.">
+<link rel="manifest" href="__PARTICLE_BASE__/manifest.webmanifest">
+<meta name="theme-color" content="#111111" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="particle">
+<link rel="apple-touch-icon" href="__PARTICLE_BASE__/icons/icon-180.png">
+<link rel="icon" href="__PARTICLE_BASE__/icons/icon-192.png" type="image/png">
+<link rel="stylesheet" href="__PARTICLE_BASE__/style.css">
+__PARTICLE_ANALYTICS__
+</head>
+<body>
+<aside id="demo-strip" class="demo-strip" hidden>
+  demo — your library is saved in this browser only ·
+  <a href="https://github.com/crnst8/particle">self-host particle →</a>
+</aside>
+<div id="app">
+  <!-- ── Library ──────────────────────────────────────────────── -->
+  <main id="library" hidden>
+    <header class="lib-head">
+      <h1 class="brand">
+        <span class="sr-only">particle</span>
+        <img class="brand-logo brand-logo-light" src="__PARTICLE_BASE__/logo.png" width="440" height="90" alt="">
+        <img class="brand-logo brand-logo-dark" src="__PARTICLE_BASE__/logo-dark.png" width="440" height="90" alt="">
+      </h1>
+      <form id="save-form" autocomplete="off">
+        <input id="url-input" type="url" inputmode="url" placeholder="paste a url, press enter"
+               aria-label="Article URL" required>
+        <button id="save-btn" type="submit">save</button>
+      </form>
+      <div id="save-status" class="save-status" role="status" aria-live="polite"></div>
+      <div id="demo-nudge" class="demo-nudge" hidden>
+        Want this library everywhere? Run your own copy:
+        <code>docker run -d -p 4747:4747 -v particle-data:/app/data ghcr.io/crnst8/particle:latest</code>
+        <button id="copy-demo-command" type="button">copy</button>
+      </div>
+      <nav class="lib-nav" aria-label="Library filters">
+        <div class="tabs" id="tabs">
+          <button data-filter="all" class="tab active">all</button>
+          <button data-filter="unread" class="tab">unread</button>
+          <button data-filter="favorites" class="tab">favorites</button>
+          <button data-filter="archived" class="tab">archive</button>
+        </div>
+        <input id="search" type="search" placeholder="search" aria-label="Search library">
+      </nav>
+    </header>
+    <ul id="list" class="article-list"></ul>
+    <div id="empty" class="empty" hidden>
+      <p class="empty-big">nothing here yet</p>
+      <p class="empty-sub" id="empty-copy">paste a url above to save your first article</p>
+    </div>
+    <footer class="library-tools">
+      <span>Save from anywhere:</span>
+      <a id="bookmarklet" href="#">drag “save to particle” to your bookmarks</a>
+    </footer>
+  </main>
+
+  <!-- ── Reader ───────────────────────────────────────────────── -->
+  <article id="reader" hidden>
+    <div id="progress-bar" aria-hidden="true"></div>
+    <header class="reader-bar">
+      <button id="back-btn" class="bar-btn" title="Back to library (esc)">&larr;</button>
+      <div class="bar-tools">
+        <button id="font-smaller" class="bar-btn" title="Smaller text">A&minus;</button>
+        <button id="font-larger" class="bar-btn" title="Larger text">A+</button>
+        <button id="font-face" class="bar-btn" title="Toggle serif / sans">Aa</button>
+        <button id="theme-btn" class="bar-btn" title="Theme: light / sepia / dark">&#9680;</button>
+        <button id="fav-btn" class="bar-btn" title="Favorite (f)">&#9734;</button>
+        <button id="archive-btn" class="bar-btn" title="Archive (e)">&#8615;</button>
+      </div>
+    </header>
+    <div class="reader-scroll" id="reader-scroll">
+      <div class="reader-inner">
+        <header class="article-head">
+          <p class="article-site" id="a-site"></p>
+          <h1 class="article-title" id="a-title"></h1>
+          <p class="article-meta" id="a-meta"></p>
+          <div class="article-note" id="a-note" hidden></div>
+        </header>
+        <div class="article-body" id="a-body"></div>
+        <footer class="article-foot">
+          <span class="foot-mark">&#9679;</span>
+          <div class="foot-actions">
+            <a id="a-original" href="#" target="_blank" rel="noopener">view original</a>
+            <button id="a-refetch" class="linklike">re-extract</button>
+            <button id="a-delete" class="linklike danger">delete</button>
+          </div>
+        </footer>
+        <p id="demo-reader-note" class="demo-reader-note" hidden>
+          Running your own copy keeps your library in one SQLite file.
+          <a href="https://github.com/crnst8/particle">Self-host particle →</a>
+        </p>
+      </div>
+    </div>
+  </article>
+</div>
+<script src="__PARTICLE_BASE__/store-local.js"></script>
+<script src="__PARTICLE_BASE__/app.js"></script>
+</body>
+</html>

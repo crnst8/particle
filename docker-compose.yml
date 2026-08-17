@@ -1,0 +1,20 @@
+# particle — local/self-hosted stack.
+# Uses the published image by default; `docker compose up --build` builds from
+# source instead.
+services:
+  particle:
+    image: ghcr.io/crnst8/particle:latest
+    build: .
+    container_name: particle
+    ports:
+      - "4747:4747"
+    # Optional — particle runs fine with no .env at all.
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - particle-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  particle-data:
