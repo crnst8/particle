@@ -1,3 +1,7 @@
+## 1.1.0 — 2026-08-23
+
+- feat: add tts via fish.audio
+
 ## 1.0.1 — 2026-08-22
 
 - Release 1.0.1.
