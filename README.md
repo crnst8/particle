@@ -143,7 +143,9 @@ and an article already saved as *partial* is rewritten in place.
 ### Optional Narration (read aloud)
 - Adds a **listen** button to the reader, with a player that follows along.
 - Writes a spoken script from the article rather than reading the raw text:
-  - Headings, quotes, captions and list items each get their own pacing and pause.
+  - Headings, quotes and list items each get their own pacing and pause, and the
+    pause is silence inside the audio, so it survives a locked phone.
+  - Image captions are left out by default; the player can turn them back on.
   - Pullquotes that only repeat the body are dropped, so nothing is read twice.
   - Code blocks and tables are skipped instead of spelled out.
   - Footnote markers vanish; links are read as their domain, not character by character.
@@ -153,8 +155,11 @@ and an article already saved as *partial* is rewritten in place.
   writes the spoken opening line and a pronunciation list for the names, acronyms
   and product names in *that* article.
 - Speaks an opening line: publication, title, author, running time.
-- Playback: scrub bar, 15-second skips, speeds from 0.85× to 2×, lock-screen and
-  headphone controls, and a resume point synced with the rest of the library.
+- Playback: scrub bar, 15-second skips, speeds from 0.85× to 2×, and a resume
+  point synced with the rest of the library.
+- Keeps playing with the screen locked, including as a home-screen app: lock-screen
+  and headphone controls, a lock-screen scrub bar over the whole article, and
+  nothing between passages that a suspended phone could fail to run.
 - Tap any paragraph to start reading from there; the paragraph being spoken is
   highlighted and scrolls into view.
 - Synthesis follows playback, so an article you abandon after a paragraph costs a
@@ -218,7 +223,7 @@ next to the compose file — see [`.env.example`](.env.example).
 | `TTS_BITRATE` | `64` | mp3 bitrate: 64, 128 or 192 kbps |
 | `TTS_SEGMENT_CHARS` | `1100` | Largest chunk of text sent in one request |
 | `TTS_CONCURRENCY` | `2` | Synthesis requests in flight at once |
-| `TTS_WARM_AHEAD` | `2` | Segments synthesised ahead of playback |
+| `TTS_WARM_AHEAD` | `3` | Segments synthesised ahead of playback |
 | `TTS_MAX_CACHE_MB` | `512` | Ceiling for cached narration audio |
 
 The older `OPENCODE_KEY`, `OPENCODE_API` and `OPENCODE_MODEL` names remain

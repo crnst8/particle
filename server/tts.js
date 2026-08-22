@@ -24,7 +24,7 @@ const voiceById = new Map();    // id → voice (whatever we have already seen)
  * One synthesis call. Returns the mp3 bytes plus the duration implied by the
  * constant bitrate, which is what the player needs before the audio loads.
  */
-export async function synthesize({ text, voiceId, speed = 1, volume = 0, temperature = 0.7, topP = 0.7 }) {
+export async function synthesize({ text, voiceId, speed = 1, volume = 0, temperature = 0.7, topP = 0.7, pauseMs = 0 }) {
   if (!KEY) throw new Error('TTS_API_KEY not set');
   const body = {
     text,
@@ -50,9 +50,54 @@ export async function synthesize({ text, voiceId, speed = 1, volume = 0, tempera
     body: JSON.stringify(body),
   }));
 
-  const audio = Buffer.from(await res.arrayBuffer());
-  if (!audio.length) throw new Error('TTS returned no audio');
+  const spoken = Buffer.from(await res.arrayBuffer());
+  if (!spoken.length) throw new Error('TTS returned no audio');
+  // The pause that follows this passage is silence inside the file, not a timer
+  // in the player: a phone with a locked screen suspends timers, not playback.
+  const audio = pauseMs > 0 ? appendSilence(spoken, pauseMs) : spoken;
   return { audio, duration: mp3Duration(audio, BITRATE) };
+}
+
+// MPEG-1 Layer III, in the order the four header bits index them.
+const FRAME_BITRATES = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const FRAME_RATES = [44100, 48000, 32000];
+
+/* Read the first audio frame's header. Every frame in a constant-bitrate stream
+   shares it, so it is also the template for a frame of silence. */
+function firstFrame(buffer) {
+  let at = 0;
+  if (buffer.length > 10 && buffer.toString('latin1', 0, 3) === 'ID3') {
+    at = 10 + (((buffer[6] & 0x7f) << 21) | ((buffer[7] & 0x7f) << 14)
+      | ((buffer[8] & 0x7f) << 7) | (buffer[9] & 0x7f));
+  }
+  for (let i = at; i < buffer.length - 4; i++) {
+    if (buffer[i] !== 0xff || (buffer[i + 1] & 0xe0) !== 0xe0) continue;
+    const version = (buffer[i + 1] >> 3) & 3;   // 3 = MPEG-1
+    const layer = (buffer[i + 1] >> 1) & 3;     // 1 = Layer III
+    const bitrate = FRAME_BITRATES[(buffer[i + 2] >> 4) & 0xf];
+    const sampleRate = FRAME_RATES[(buffer[i + 2] >> 2) & 3];
+    if (version !== 3 || layer !== 1 || !bitrate || !sampleRate) continue;
+    const padding = (buffer[i + 2] >> 1) & 1;
+    return {
+      header: buffer.subarray(i, i + 4),
+      length: Math.floor((144 * bitrate * 1000) / sampleRate) + padding,
+      seconds: 1152 / sampleRate,
+    };
+  }
+  return null;
+}
+
+/* Frames carrying this stream's own header and an empty payload decode to
+   digital silence, so the pause costs nothing to synthesise and joins the
+   passage as one continuous file. */
+export function appendSilence(audio, ms) {
+  const frame = firstFrame(audio);
+  if (!frame) return audio;
+  const count = Math.round((ms / 1000) / frame.seconds);
+  if (count < 1) return audio;
+  const pad = Buffer.alloc(frame.length * count);
+  for (let i = 0; i < count; i++) frame.header.copy(pad, i * frame.length);
+  return Buffer.concat([audio, pad]);
 }
 
 /**

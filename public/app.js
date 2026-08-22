@@ -601,7 +601,6 @@
     playing: false,
     decks: null,
     deck: 0,
-    gapTimer: null,
     saveTimer: null,
     ticker: null,
     lit: [],
@@ -610,15 +609,22 @@
     set rate(v) { localStorage.setItem('p.rate', String(v)); },
     get follow() { return localStorage.getItem('p.follow') !== '0'; },
     set follow(v) { localStorage.setItem('p.follow', v ? '1' : '0'); },
-    get captions() { return localStorage.getItem('p.captions') !== '0'; },
+    get captions() { return localStorage.getItem('p.captions') === '1'; },
     set captions(v) { localStorage.setItem('p.captions', v ? '1' : '0'); },
   };
 
+  /* Two audio elements take turns: one plays while the other loads what comes
+     next. They live in the document and carry the pause between passages inside
+     their own audio, because a phone with a locked screen keeps playing a file
+     but stops running the timer that would have started the next one. */
   function decks() {
     if (!player.decks) {
       player.decks = [new Audio(), new Audio()];
       for (const deck of player.decks) {
         deck.preload = 'auto';
+        deck.playsInline = true;
+        deck.hidden = true;
+        player.el.appendChild(deck);
         deck.addEventListener('ended', () => { if (deck === current()) afterSegment(); });
         deck.addEventListener('loadedmetadata', () => reconcileDuration(deck));
         deck.addEventListener('error', () => { if (deck === current() && deck.dataset.seq) segmentFailed(); });
@@ -702,9 +708,8 @@
      so reopening picks the narration back up where it stopped. */
   function resetNarration() {
     if (player.manifest) savePosition(elapsed(), { now: true });
-    clearTimeout(player.gapTimer);
     clearInterval(player.ticker);
-    player.gapTimer = player.ticker = null;
+    player.ticker = null;
     if (player.decks) {
       for (const deck of player.decks) {
         deck.pause();
@@ -743,7 +748,6 @@
   function pause({ persist = true } = {}) {
     player.playing = false;
     setPlayIcon(false);
-    clearTimeout(player.gapTimer);
     clearInterval(player.ticker);
     player.ticker = null;
     if (player.decks) for (const deck of player.decks) deck.pause();
@@ -761,7 +765,6 @@
     if (index >= segments.length) return finish();
     if (!audible(segments[index])) return playSegment(index + 1, 0);
 
-    clearTimeout(player.gapTimer);
     for (const deck of decks()) deck.pause();
     // the spare deck may already hold this segment from the prefetch
     if (idle().dataset.seq === String(index) && current().dataset.seq !== String(index)) {
@@ -796,13 +799,12 @@
 
   function afterSegment() {
     const segments = player.manifest?.segments || [];
-    const gap = (segments[player.index]?.gap || 0) / player.rate;
     savePosition(elapsed());
     let next = player.index + 1;
     while (next < segments.length && !audible(segments[next])) next += 1;
     if (next >= segments.length) return finish();
-    clearTimeout(player.gapTimer);
-    player.gapTimer = setTimeout(() => playSegment(next, 0), gap);
+    // straight into the next file: the pause was already spoken as silence
+    playSegment(next, 0);
   }
 
   function preloadNext() {
@@ -831,16 +833,17 @@
   }
 
   // ── timeline ─────────────────────────────────────────────────────────────
-  /* Where each segment sits on one continuous clock, gaps included. Durations
-     start as the server's estimate and are replaced by the real thing as the
-     audio loads, so the bar tightens up rather than jumping. */
+  /* Where each segment sits on one continuous clock. Each duration already
+     covers the pause that follows it. They start as the server's estimate and
+     are replaced by the real thing as the audio loads, so the bar tightens up
+     rather than jumping. */
   function timeline() {
     const segments = player.manifest?.segments || [];
     const marks = [];
     let at = 0;
     for (const segment of segments) {
       marks.push(at);
-      if (audible(segment)) at += segment.duration + segment.gap / 1000;
+      if (audible(segment)) at += segment.duration;
     }
     return { marks, total: at };
   }
@@ -866,9 +869,13 @@
 
   const jump = delta => seekTo(elapsed() + delta, { play: player.playing });
 
+  let sessionTick = 0;
   function startTicker() {
     clearInterval(player.ticker);
-    player.ticker = setInterval(updateTransport, 250);
+    player.ticker = setInterval(() => {
+      updateTransport();
+      if (++sessionTick % 8 === 0) updateMediaSession();
+    }, 250);
   }
 
   function updateTransport() {
@@ -1015,6 +1022,15 @@
           : [],
       });
       navigator.mediaSession.playbackState = player.playing ? 'playing' : 'paused';
+      // gives the lock screen a real scrub bar over the whole article
+      const { total } = timeline();
+      if (total > 0) {
+        navigator.mediaSession.setPositionState({
+          duration: total,
+          position: Math.min(elapsed(), total),
+          playbackRate: player.rate,
+        });
+      }
     } catch { /* metadata is a nicety */ }
     const bind = (action, handler) => {
       try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* unsupported action */ }
@@ -1025,6 +1041,10 @@
     bind('seekforward', () => jump(SKIP_SECONDS));
     bind('nexttrack', () => afterSegment());
     bind('previoustrack', () => seekTo(timeline().marks[Math.max(0, player.index - 1)] || 0, { play: player.playing }));
+    bind('seekto', (details) => {
+      if (Number.isFinite(details?.seekTime)) seekTo(details.seekTime, { play: player.playing });
+    });
+    bind('stop', () => pause());
   }
 
   // ── wiring ───────────────────────────────────────────────────────────────

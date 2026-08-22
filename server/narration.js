@@ -8,7 +8,7 @@ import { listVoices, knownVoice, pinnedVoiceId, VOICE_LOCKED } from './tts.js';
 import { isLlmConfigured, directNarration } from './llm.js';
 
 // Bump when the script builder changes shape; cached audio is rebuilt.
-export const SCRIPT_VERSION = 1;
+export const SCRIPT_VERSION = 2;
 
 const MAX_SEGMENT_CHARS = positiveInt(process.env.TTS_SEGMENT_CHARS, 1100);
 const MERGE_UNDER_CHARS = 260;
@@ -18,15 +18,20 @@ const MERGE_CEILING_CHARS = 700;
 // finds the paragraph being spoken, so the client runs the same query.
 export const BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, blockquote, li, figcaption, pre, dt, dd';
 
+/* `pause` is milliseconds of silence appended to the segment's own audio, so the
+   gap between passages survives a locked screen — a suspended phone stops
+   running timers long before it stops playing a file. */
 const KIND_STYLE = {
-  intro:   { speed: 0.98, temperature: 0.60, volume: 0,  gap: 700 },
-  heading: { speed: 0.95, temperature: null, volume: 0,  gap: 620 },
-  text:    { speed: 1.00, temperature: null, volume: 0,  gap: 300 },
-  item:    { speed: 1.00, temperature: null, volume: 0,  gap: 240 },
-  quote:   { speed: 0.96, temperature: 0.06, volume: 0,  gap: 500 },  // temperature is a delta
-  caption: { speed: 1.02, temperature: null, volume: -2, gap: 380 },
-  outro:   { speed: 0.95, temperature: 0.55, volume: -1, gap: 0 },
+  intro:   { speed: 0.98, temperature: 0.60, volume: 0,  pause: 900 },
+  heading: { speed: 0.95, temperature: null, volume: 0,  pause: 800 },
+  text:    { speed: 1.00, temperature: null, volume: 0,  pause: 460 },
+  item:    { speed: 1.00, temperature: null, volume: 0,  pause: 320 },
+  quote:   { speed: 0.96, temperature: 0.06, volume: 0,  pause: 640 },  // temperature is a delta
+  caption: { speed: 1.02, temperature: null, volume: -2, pause: 460 },
+  outro:   { speed: 0.95, temperature: 0.55, volume: -1, pause: 0 },
 };
+// Between two halves of one paragraph that was too long for a single request.
+const SPLIT_PAUSE = 200;
 
 // ── the script ───────────────────────────────────────────────────────────────
 
@@ -69,7 +74,7 @@ export function buildScript(article, direction = {}) {
       kind,
       text,
       blocks: blockIndices,
-      gap: last ? style.gap : 140,
+      pause: last ? style.pause : SPLIT_PAUSE,
       chars: text.length,
     });
   };
@@ -162,6 +167,25 @@ const CURRENCY = {
 };
 const MAGNITUDE = { k: 'thousand', m: 'million', bn: 'billion', b: 'billion', tn: 'trillion', t: 'trillion' };
 
+const TITLES = {
+  Dr: 'Doctor', Mr: 'Mister', Mrs: 'Missus', Ms: 'Miz', Prof: 'Professor', Rev: 'Reverend',
+  Sen: 'Senator', Rep: 'Representative', Gov: 'Governor', Gen: 'General', Sgt: 'Sergeant',
+  Capt: 'Captain', Lt: 'Lieutenant', Col: 'Colonel', Msgr: 'Monsignor', Fr: 'Father',
+  Jr: 'Junior', Sr: 'Senior',
+};
+// "St." is deliberately absent: Saint and Street are not distinguishable here.
+
+const CENTURIES = { 17: 'seventeen', 18: 'eighteen', 19: 'nineteen', 20: 'twenty' };
+const DECADES = {
+  '00': 'hundreds', 10: 'tens', 20: 'twenties', 30: 'thirties', 40: 'forties',
+  50: 'fifties', 60: 'sixties', 70: 'seventies', 80: 'eighties', 90: 'nineties',
+};
+
+function sayDecade(century, decade) {
+  if (decade === '00') return century === '20' ? 'two thousands' : `${CENTURIES[century]} hundreds`;
+  return `${CENTURIES[century]} ${DECADES[decade]}`;
+}
+
 const REWRITES = [
   // invisible characters and layout whitespace
   [/[\u200B-\u200F\u2060\uFEFF]/g, ''],
@@ -190,12 +214,19 @@ const REWRITES = [
   [/\bFig\.(?=\s*\d)/gi, 'figure'],
   [/\band\/or\b/gi, 'and or'],
   [/\s&\s/g, ' and '],
+  // a title's full stop is not the end of a sentence; say the word instead
+  [/\b(Dr|Mr|Mrs|Ms|Prof|Rev|Sen|Rep|Gov|Gen|Sgt|Capt|Lt|Col|Msgr|Fr)\.(?=\s+[A-Z])/g,
+    (_match, title) => TITLES[title]],
+  [/\b(Jr|Sr)\./g, (_match, suffix) => TITLES[suffix]],
   // money, percentages, spans of years
   [/(?:US)?([$£€¥₹₩])\s?(\d[\d,]*(?:\.\d+)?)\s?(bn|tn|[kmbt])?\b/gi, (_match, symbol, number, magnitude) => {
     const scale = magnitude ? ` ${MAGNITUDE[magnitude.toLowerCase()]}` : '';
     return `${number}${scale} ${CURRENCY[symbol] || 'units'}`;
   }],
   [/(\d)\s?%/g, '$1 percent'],
+  // decades: "the 2010s" is spoken, not spelled
+  [/\b(17|18|19|20)([0-9]0)'?s\b/g, (_match, century, decade) => sayDecade(century, decade)],
+  [/['\u2018\u2019]([0-9]0)s\b/g, (_match, decade) => DECADES[decade] || `${decade}s`],
   [/\b(\d{4})\s?[–—-]\s?(\d{2,4})\b/g, '$1 to $2'],
   [/(\d)\s?–\s?(\d)/g, '$1 to $2'],
   [/(\d)\s?(a\.m\.|p\.m\.|am|pm)\b/gi, (_match, digit, meridiem) => `${digit} ${meridiem.replace(/\./g, '').toUpperCase()}`],

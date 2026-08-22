@@ -29,6 +29,22 @@ test('drops footnote markers and spells links as domains', () => {
   assert.equal(speakable('See https://www.example.com/a/b for more'), 'See example dot com for more.');
 });
 
+test('says a decade rather than spelling it', () => {
+  assert.equal(speakable('The 2010s beat the 1990s.'), 'The twenty tens beat the nineteen nineties.');
+  assert.equal(speakable('Back in the 2000s'), 'Back in the two thousands.');
+  assert.equal(speakable('Built in the 1900s'), 'Built in the nineteen hundreds.');
+  assert.equal(speakable('That \u201880s sound'), 'That eighties sound.');
+  assert.equal(speakable('It was 2010 exactly'), 'It was 2010 exactly.');
+});
+
+test('a title is a word, not the end of a sentence', () => {
+  assert.equal(speakable('Dr. Pausch told Mr. Atwood'), 'Doctor Pausch told Mister Atwood.');
+  assert.equal(speakable('Prof. Diaz and Ms. Lee'), 'Professor Diaz and Miz Lee.');
+  assert.equal(speakable('John Smith Jr. left'), 'John Smith Junior left.');
+  // an address is not a doctor
+  assert.equal(speakable('It is on Elm Dr. nearby'), 'It is on Elm Dr. nearby.');
+});
+
 test('turns an em dash into a pause and a year span into a range', () => {
   assert.equal(speakable('The plan—if it was one—failed'), 'The plan, if it was one, failed.');
   assert.equal(speakable('Between 2019-2024 it doubled'), 'Between 2019 to 2024 it doubled.');
@@ -86,7 +102,16 @@ test('a heading is given more silence after it than a paragraph', () => {
   const script = buildScript(article({ content_html: '<h2>Section</h2><p>Body text goes here.</p>' }));
   const heading = script.segments.find(segment => segment.kind === 'heading');
   const text = script.segments.find(segment => segment.kind === 'text');
-  assert.ok(heading.gap > text.gap);
+  assert.ok(heading.pause > text.pause);
+  assert.ok(text.pause > 0);
+});
+
+test('a paragraph split in two pauses less in the middle than at the end', () => {
+  const long = `${'A sentence that keeps going and going for a while. '.repeat(40)}`;
+  const script = buildScript(article({ content_html: `<p>${long}</p>` }));
+  const parts = script.segments.filter(segment => segment.kind === 'text');
+  assert.ok(parts.length > 1);
+  assert.ok(parts[0].pause < parts.at(-1).pause);
 });
 
 test('a pullquote repeating the body is not read twice', () => {

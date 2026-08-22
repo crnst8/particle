@@ -7,7 +7,7 @@ import { planNarration, contentHash, segmentStyle } from './narration.js';
 
 const CONCURRENCY = positiveInt(process.env.TTS_CONCURRENCY, 2);
 const MAX_CACHE_BYTES = positiveInt(process.env.TTS_MAX_CACHE_MB, 512) * 1024 * 1024;
-const WARM_AHEAD = positiveInt(process.env.TTS_WARM_AHEAD, 2);
+const WARM_AHEAD = positiveInt(process.env.TTS_WARM_AHEAD, 3);
 
 export function createNarrator(store) {
   const inFlight = new Map();   // "articleId:seq" → Promise<{audio, duration}>
@@ -68,6 +68,7 @@ export function createNarrator(store) {
         volume: style.volume,
         temperature: style.temperature,
         topP: style.topP,
+        pauseMs: spec.pause || 0,
       });
       store.saveNarrationSegment(article.id, seq, audio, duration);
       store.pruneNarrationAudio(MAX_CACHE_BYTES, article.id);
@@ -96,7 +97,7 @@ export function createNarrator(store) {
       kind: spec.kind,
       text: spec.text,
       blocks: spec.blocks,
-      gap: spec.gap,
+      pause: spec.pause,
       chars: spec.chars,
       duration: ready.get(spec.seq)?.duration ?? estimateDuration(spec, narration.direction),
       ready: ready.has(spec.seq),
@@ -116,7 +117,7 @@ export function createNarrator(store) {
       pronunciations: narration.direction?.pronunciations || [],
       blocks: narration.script.blocks || [],
       segments,
-      duration: Number(segments.reduce((sum, s) => sum + s.duration + s.gap / 1000, 0).toFixed(2)),
+      duration: Number(segments.reduce((sum, s) => sum + s.duration, 0).toFixed(2)),
       ready_count: segments.filter(s => s.ready).length,
       audio_pos: article.audio_pos || 0,
     };
@@ -147,13 +148,14 @@ export function createNarrator(store) {
 /* Before a segment is synthesised its length is a guess, and the player needs
    one to draw a scrub bar. Measured against real output, prose lands near 15.5
    characters a second at normal pace; the clipped, full-stopped opening and
-   closing lines run slower. The real duration replaces this as audio arrives. */
+   closing lines run slower. The trailing pause is part of the file, so it is
+   part of the guess. The real duration replaces this as the audio arrives. */
 const CHARS_PER_SECOND = { intro: 9, outro: 9, heading: 12, caption: 14 };
 
 function estimateDuration(spec, direction) {
   const speed = segmentStyle(spec.kind, direction).speed || 1;
   const rate = (CHARS_PER_SECOND[spec.kind] || 15.5) * speed;
-  return Number((spec.chars / rate).toFixed(2));
+  return Number((spec.chars / rate + (spec.pause || 0) / 1000).toFixed(2));
 }
 
 function positiveInt(value, fallback) {
