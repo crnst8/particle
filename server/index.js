@@ -8,6 +8,8 @@ import { extractArticle, normalizeUrl, BROWSER_UA } from './extract.js';
 import { findArchiveSnapshot, parseArchiveUrl } from './archive-today.js';
 import { claimTicket, createTicket, readTicket, settleTicket } from './handoff.js';
 import { isLlmConfigured, assessArticle } from './llm.js';
+import { createNarrator } from './narrator.js';
+import { isTtsConfigured, listVoices } from './tts.js';
 import { safeFetch } from './net.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +30,8 @@ const VERSION = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), '
 const shellTemplate = readFileSync(join(pub, 'index.html'), 'utf8');
 const manifestTemplate = JSON.parse(readFileSync(join(pub, 'manifest.webmanifest'), 'utf8'));
 const store = DEMO_MODE ? null : await import('./db.js');
+// Narration needs somewhere to keep the audio, so it follows the library server.
+const narrator = store && isTtsConfigured ? createNarrator(store) : null;
 
 const app = express();
 app.disable('x-powered-by');
@@ -53,7 +57,9 @@ app.use(express.json({ limit: '1mb' }));
 
 // ── API ──────────────────────────────────────────────────────────────────────
 
-app.get(api('/health'), (_req, res) => res.json({ ok: true, app: 'particle', version: VERSION, demo: DEMO_MODE }));
+app.get(api('/health'), (_req, res) => res.json({
+  ok: true, app: 'particle', version: VERSION, demo: DEMO_MODE, narration: Boolean(narrator),
+}));
 
 if (DEMO_MODE) {
   const extractLimit = rateLimit({ limit: positiveInt(process.env.DEMO_EXTRACTS_PER_MINUTE, 10) });
@@ -295,6 +301,7 @@ function registerLibraryRoutes(router) {
     if ('progress' in body) fields.progress = Math.max(0, Math.min(1, Number(body.progress) || 0));
     if ('read' in body) fields.read_at = body.read ? new Date().toISOString() : null;
     if ('tags' in body && Array.isArray(body.tags)) fields.tags = body.tags;
+    if ('audio_pos' in body) fields.audio_pos = Math.max(0, Number(body.audio_pos) || 0);
     res.json(store.updateArticle(id, fields));
   });
 
@@ -302,6 +309,101 @@ function registerLibraryRoutes(router) {
     store.deleteArticle(Number(req.params.id));
     res.json({ ok: true });
   });
+
+  if (narrator) registerNarrationRoutes(router);
+}
+
+/* ── narration ───────────────────────────────────────────────────────────────
+   The script and the casting come back as one manifest; the audio for each
+   segment is a separate URL the player pulls as it goes, which is what keeps a
+   long article from being synthesised in full before a word is heard. */
+function registerNarrationRoutes(router) {
+  const findArticle = (req, res) => {
+    const article = store.getArticle(Number(req.params.id));
+    if (!article) res.status(404).json({ error: 'not found' });
+    return article;
+  };
+
+  router.get(api('/narration/voices'), async (req, res) => {
+    try {
+      const voices = await listVoices(String(req.query.lang || 'en'));
+      res.json(voices.map(({ id, title, description, tags, sample }) => ({ id, title, description, tags, sample })));
+    } catch (error) {
+      res.status(502).json({ error: error.message });
+    }
+  });
+
+  router.get(api('/articles/:id/narration'), async (req, res) => {
+    const article = findArticle(req, res);
+    if (!article) return;
+    const existing = store.getNarration(article.id);
+    if (!existing) return res.status(404).json({ error: 'not narrated yet' });
+    res.json(narrator.manifest(article, existing));
+  });
+
+  router.post(api('/articles/:id/narration'), async (req, res) => {
+    const article = findArticle(req, res);
+    if (!article) return;
+    if (!article.text_content) return res.status(422).json({ error: 'nothing to read aloud' });
+    try {
+      const narration = await narrator.ensure(article, {
+        force: Boolean(req.body?.force),
+        voiceId: typeof req.body?.voice_id === 'string' ? req.body.voice_id.trim() : null,
+      });
+      const manifest = narrator.manifest(article, narration);
+      res.json(manifest);
+      narrator.warm(article, narration, Math.max(0, Number(req.body?.from) || 0));
+    } catch (error) {
+      res.status(502).json({ error: error.message });
+    }
+  });
+
+  router.get(api('/articles/:id/narration/:seq'), async (req, res) => {
+    const article = findArticle(req, res);
+    if (!article) return;
+    const narration = store.getNarration(article.id);
+    if (!narration) return res.status(404).json({ error: 'not narrated yet' });
+
+    const seq = Number(req.params.seq);
+    if (!Number.isInteger(seq) || seq < 0) return res.status(400).json({ error: 'bad segment' });
+
+    try {
+      const { audio, duration } = await narrator.segment(article, narration, seq);
+      store.touchNarration(article.id);
+      sendAudio(req, res, audio, { duration });
+      narrator.warm(article, narration, seq + 1);
+    } catch (error) {
+      res.status(error.statusCode || 502).json({ error: error.message });
+    }
+  });
+
+  router.delete(api('/articles/:id/narration'), (req, res) => {
+    const article = findArticle(req, res);
+    if (!article) return;
+    narrator.drop(article.id);
+    res.json({ ok: true });
+  });
+}
+
+// Segments are small and complete, but Safari will not start playback without a
+// range answer, so give it one.
+function sendAudio(req, res, audio, { duration }) {
+  res.set('Content-Type', 'audio/mpeg');
+  res.set('Cache-Control', 'private, max-age=604800, immutable');
+  res.set('X-Narration-Duration', String(duration));
+  res.set('Accept-Ranges', 'bytes');
+
+  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+  if (!range) return res.status(200).send(audio);
+
+  const start = range[1] ? Number(range[1]) : 0;
+  const end = range[2] ? Math.min(Number(range[2]), audio.length - 1) : audio.length - 1;
+  if (!(start <= end && start < audio.length)) {
+    return res.status(416).set('Content-Range', `bytes */${audio.length}`).end();
+  }
+  res.status(206)
+    .set('Content-Range', `bytes ${start}-${end}/${audio.length}`)
+    .send(audio.subarray(start, end + 1));
 }
 
 function normalizeBase(value) {

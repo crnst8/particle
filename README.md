@@ -140,6 +140,28 @@ and an article already saved as *partial* is rewritten in place.
 - Can be installed to the home screen.
 - Saved articles can be read offline.
 
+### Optional Narration (read aloud)
+- Adds a **listen** button to the reader, with a player that follows along.
+- Writes a spoken script from the article rather than reading the raw text:
+  - Headings, quotes, captions and list items each get their own pacing and pause.
+  - Pullquotes that only repeat the body are dropped, so nothing is read twice.
+  - Code blocks and tables are skipped instead of spelled out.
+  - Footnote markers vanish; links are read as their domain, not character by character.
+  - `12%`, `$1.2bn`, `e.g.`, `2019–2024` and em dashes are said the way a person would.
+- Casts a voice per article from the provider's catalogue — subject, length and
+  the article's own tags decide the register. With an LLM key configured it also
+  writes the spoken opening line and a pronunciation list for the names, acronyms
+  and product names in *that* article.
+- Speaks an opening line: publication, title, author, running time.
+- Playback: scrub bar, 15-second skips, speeds from 0.85× to 2×, lock-screen and
+  headphone controls, and a resume point synced with the rest of the library.
+- Tap any paragraph to start reading from there; the paragraph being spoken is
+  highlighted and scrolls into view.
+- Synthesis follows playback, so an article you abandon after a paragraph costs a
+  paragraph. Audio is cached in the same SQLite file and replays for free.
+- Voices can be swapped, or the whole narration recast, from the player.
+- Disabled by default until configured.
+
 ### Optional AI Tagging
 - Supports any OpenAI-compatible endpoint.
 - Automatically assigns 1–3 topic tags to saved articles.
@@ -157,6 +179,8 @@ and an article already saved as *partial* is rewritten in place.
  `f` favourite 
  
  `e` archive 
+ 
+ `l` listen 
  
   `/` search 
 
@@ -186,9 +210,25 @@ next to the compose file — see [`.env.example`](.env.example).
 | `LLM_API_KEY` | unset | API key for the optional tagging/quality pass. Unset = feature off |
 | `LLM_API_URL` | OpenCode Zen | Any OpenAI-compatible `/chat/completions` URL — Ollama, OpenRouter, whatever you run |
 | `LLM_MODEL` | `deepseek-v4-flash` | Model name for the above |
+| `TTS_API_KEY` | unset | API key for narration. Unset = feature off. A free [Fish Audio](https://fish.audio) key works |
+| `TTS_API_URL` | Fish Audio | Text-to-speech endpoint |
+| `TTS_MODEL` | `s2.1-pro-free` | Voice model sent in the `model` header |
+| `TTS_VOICE_ID` | unset | Pin one voice instead of casting per article |
+| `TTS_VOICE_LOCK` | `0` | Set to `1` to use `TTS_VOICE_ID` for everything |
+| `TTS_BITRATE` | `64` | mp3 bitrate: 64, 128 or 192 kbps |
+| `TTS_SEGMENT_CHARS` | `1100` | Largest chunk of text sent in one request |
+| `TTS_CONCURRENCY` | `2` | Synthesis requests in flight at once |
+| `TTS_WARM_AHEAD` | `2` | Segments synthesised ahead of playback |
+| `TTS_MAX_CACHE_MB` | `512` | Ceiling for cached narration audio |
 
 The older `OPENCODE_KEY`, `OPENCODE_API` and `OPENCODE_MODEL` names remain
-accepted as aliases.
+accepted as aliases, as do `FISH_AUDIO_API` and `FISH_API_KEY` for `TTS_API_KEY`.
+
+Narration and tagging are independent. Narration works on its own; adding an
+`LLM_API_KEY` on top is what lets it read the article before casting it — the
+voice, the pace, the spoken opening line and the per-article pronunciation list
+all come from that pass. Without it, particle falls back to the article's tags
+and the voice catalogue's own labels.
 
 Authentication is off by default for a frictionless localhost install. If the
 port is reachable from the public internet, set `PARTICLE_PASSWORD`; for example:
@@ -201,7 +241,8 @@ docker run -d --name particle -p 4747:4747 -v particle-data:/app/data \
 
 ## Data storage 
 
-Everything lives in one SQLite file. Back it up by copying it:
+Everything lives in one SQLite file — narration audio included. Back it up by
+copying it:
 
 ```sh
 docker cp particle:/app/data/particle.db ./particle-backup.db

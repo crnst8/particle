@@ -13,7 +13,7 @@ db.exec(`
 `);
 
 const { user_version: version } = db.prepare('PRAGMA user_version').get();
-if (version > 1) throw new Error(`Database schema ${version} is newer than this particle build supports`);
+if (version > 2) throw new Error(`Database schema ${version} is newer than this particle build supports`);
 
 if (version < 1) db.exec(`
   BEGIN IMMEDIATE;
@@ -66,6 +66,42 @@ if (version < 1) db.exec(`
   END;
 
   PRAGMA user_version = 1;
+  COMMIT;
+`);
+
+// v2 — narration: where a spoken rendering of an article and its audio live.
+if (version < 2) db.exec(`
+  BEGIN IMMEDIATE;
+
+  ALTER TABLE articles ADD COLUMN audio_pos REAL DEFAULT 0;
+
+  CREATE TABLE IF NOT EXISTS narrations (
+    article_id   INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL,
+    language     TEXT,
+    voice_id     TEXT,
+    voice_name   TEXT,
+    tone         TEXT,
+    reason       TEXT,
+    source       TEXT,
+    direction    TEXT NOT NULL DEFAULT '{}',
+    script       TEXT NOT NULL DEFAULT '{}',
+    format       TEXT NOT NULL DEFAULT 'mp3',
+    created_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    played_at    TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS narration_segments (
+    article_id INTEGER NOT NULL REFERENCES narrations(article_id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    audio      BLOB NOT NULL,
+    bytes      INTEGER NOT NULL,
+    duration   REAL NOT NULL,
+    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (article_id, seq)
+  );
+
+  PRAGMA user_version = 2;
   COMMIT;
 `);
 
@@ -123,7 +159,7 @@ export function replaceArticleContent(id, a) {
 }
 
 export function updateArticle(id, fields) {
-  const allowed = ['favorite', 'archived', 'progress', 'read_at', 'tags', 'quality', 'quality_note', 'title'];
+  const allowed = ['favorite', 'archived', 'progress', 'read_at', 'tags', 'quality', 'quality_note', 'title', 'audio_pos'];
   const sets = [];
   const params = [];
   for (const k of allowed) {
@@ -153,4 +189,94 @@ function hydrate(row) {
 
 function safeJson(s, fallback) {
   try { return JSON.parse(s); } catch { return fallback; }
+}
+
+// ── narration ────────────────────────────────────────────────────────────────
+// A narration is one spoken rendering of one version of an article: the script,
+// the casting decisions behind it, and the audio for each segment as it is
+// synthesised. Rebuilding is cheap for the script and expensive for the audio,
+// so the audio is what the cache is really for.
+
+export function getNarration(articleId) {
+  const row = db.prepare('SELECT * FROM narrations WHERE article_id = ?').get(articleId);
+  if (!row) return null;
+  return { ...row, direction: safeJson(row.direction, {}), script: safeJson(row.script, { segments: [] }) };
+}
+
+export function saveNarration(articleId, narration) {
+  db.prepare(`
+    INSERT INTO narrations (article_id, content_hash, language, voice_id, voice_name, tone, reason,
+      source, direction, script, format, created_at, played_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), NULL)
+    ON CONFLICT(article_id) DO UPDATE SET
+      content_hash=excluded.content_hash, language=excluded.language, voice_id=excluded.voice_id,
+      voice_name=excluded.voice_name, tone=excluded.tone, reason=excluded.reason, source=excluded.source,
+      direction=excluded.direction, script=excluded.script, format=excluded.format,
+      created_at=excluded.created_at, played_at=NULL
+  `).run(articleId, narration.content_hash, narration.language, narration.voice_id, narration.voice_name,
+    narration.tone, narration.reason, narration.source,
+    JSON.stringify(narration.direction || {}), JSON.stringify(narration.script || {}), narration.format || 'mp3');
+  return getNarration(articleId);
+}
+
+export function deleteNarration(articleId) {
+  db.prepare('DELETE FROM narration_segments WHERE article_id = ?').run(articleId);
+  db.prepare('DELETE FROM narrations WHERE article_id = ?').run(articleId);
+}
+
+export function getNarrationSegment(articleId, seq) {
+  return db.prepare('SELECT seq, audio, bytes, duration FROM narration_segments WHERE article_id = ? AND seq = ?')
+    .get(articleId, seq) || null;
+}
+
+export function hasNarrationSegment(articleId, seq) {
+  return Boolean(db.prepare('SELECT 1 FROM narration_segments WHERE article_id = ? AND seq = ?').get(articleId, seq));
+}
+
+export function saveNarrationSegment(articleId, seq, audio, duration) {
+  db.prepare(`
+    INSERT INTO narration_segments (article_id, seq, audio, bytes, duration) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(article_id, seq) DO UPDATE SET
+      audio=excluded.audio, bytes=excluded.bytes, duration=excluded.duration,
+      created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `).run(articleId, seq, audio, audio.length, duration);
+}
+
+/** Which segments are already synthesised, and how long each one runs. */
+export function narrationSegmentIndex(articleId) {
+  return db.prepare('SELECT seq, bytes, duration FROM narration_segments WHERE article_id = ? ORDER BY seq')
+    .all(articleId);
+}
+
+export function touchNarration(articleId) {
+  db.prepare("UPDATE narrations SET played_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE article_id = ?")
+    .run(articleId);
+}
+
+/* Audio is by far the largest thing particle stores. Keep the cache under the
+   configured ceiling by dropping the least recently listened-to narrations —
+   the script survives, so they re-synthesise on the next play. */
+export function pruneNarrationAudio(maxBytes, keepArticleId) {
+  const { total } = db.prepare('SELECT COALESCE(SUM(bytes), 0) AS total FROM narration_segments').get();
+  if (total <= maxBytes) return { total, freed: 0 };
+
+  const candidates = db.prepare(`
+    SELECT s.article_id AS article_id, SUM(s.bytes) AS bytes,
+           COALESCE(n.played_at, n.created_at, '') AS used_at
+    FROM narration_segments s LEFT JOIN narrations n ON n.article_id = s.article_id
+    GROUP BY s.article_id ORDER BY used_at ASC
+  `).all();
+
+  let freed = 0;
+  for (const row of candidates) {
+    if (total - freed <= maxBytes) break;
+    if (row.article_id === keepArticleId) continue;
+    db.prepare('DELETE FROM narration_segments WHERE article_id = ?').run(row.article_id);
+    freed += row.bytes;
+  }
+  return { total: total - freed, freed };
+}
+
+export function narrationCacheBytes() {
+  return db.prepare('SELECT COALESCE(SUM(bytes), 0) AS total FROM narration_segments').get().total;
 }

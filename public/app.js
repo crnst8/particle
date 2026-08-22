@@ -16,6 +16,7 @@
     articles: [],
     current: null,       // article open in reader
     progressTimer: null,
+    narration: false,    // server has a text-to-speech key configured
   };
 
   // ── prefs ────────────────────────────────────────────────────────────────
@@ -88,6 +89,7 @@
   // ── library ──────────────────────────────────────────────────────────────
   async function showLibrary() {
     saveReadingProgress();
+    resetNarration();
     reader.hidden = true;
     library.hidden = false;
     progressBar.style.width = '0';
@@ -238,6 +240,7 @@
     let a;
     try { a = await api.get(id); }
     catch { return go('/'); }
+    resetNarration();
     state.current = a;
 
     library.hidden = true;
@@ -283,6 +286,7 @@
       !p.querySelector('em:first-child'));
     if (firstP) firstP.classList.add('dropcap');
     $('a-original').href = a.url;
+    $('listen-btn').hidden = !state.narration;
     updateFavUi(a);
 
     // mark read on open
@@ -366,11 +370,16 @@
   document.addEventListener('keydown', (ev) => {
     if (ev.target.matches('input, textarea')) return;
     if (!reader.hidden) {
+      const listening = !$('player').hidden;
       if (ev.key === 'Escape') go('/');
       if (ev.key === 'f') $('fav-btn').click();
       if (ev.key === 'e') $('archive-btn').click();
+      if (ev.key === 'l' && state.narration) $('listen-btn').click();
       if (ev.key === 'j') scroller.scrollBy({ top: scroller.clientHeight * 0.85, behavior: 'smooth' });
       if (ev.key === 'k') scroller.scrollBy({ top: -scroller.clientHeight * 0.85, behavior: 'smooth' });
+      if (listening && ev.key === ' ') { ev.preventDefault(); $('pl-play').click(); }
+      if (listening && ev.key === 'ArrowLeft') { ev.preventDefault(); $('pl-back').click(); }
+      if (listening && ev.key === 'ArrowRight') { ev.preventDefault(); $('pl-fwd').click(); }
     } else if (ev.key === '/') {
       ev.preventDefault();
       search.focus();
@@ -386,11 +395,13 @@
       api.patch(state.current.id, { progress: p }).catch(() => {});
       return;
     }
+    const body = { progress: p };
+    if (player.manifest && player.articleId === state.current.id) body.audio_pos = elapsed();
     fetch(appUrl(`/api/articles/${state.current.id}`), {
       method: 'PATCH',
       keepalive: true,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ progress: p }),
+      body: JSON.stringify(body),
     }).catch(() => {});
   });
 
@@ -569,6 +580,497 @@
     mount.innerHTML = `<p class="rescue-head${kind === 'error' ? ' error' : ''}">${esc(message)}</p>`;
   }
 
+  // ── narration ────────────────────────────────────────────────────────────
+  // The server hands back a script: what to read, in what order, and the pause
+  // each block earns. Audio arrives one segment at a time, so listening starts
+  // after the opening line rather than after the whole article is synthesised.
+  // Two audio elements take turns, which is what removes the seam between them.
+  const BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, blockquote, li, figcaption, pre, dt, dd';
+  const RATES = [0.85, 1, 1.15, 1.3, 1.5, 1.75, 2];
+  const SKIP_SECONDS = 15;
+  // played inside the click that starts narration, so iOS and Chrome count the
+  // audio elements as user-initiated before the first segment has downloaded
+  const SILENCE = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=';
+
+  const player = {
+    el: $('player'),
+    manifest: null,
+    articleId: null,
+    blocks: [],
+    index: 0,
+    playing: false,
+    decks: null,
+    deck: 0,
+    gapTimer: null,
+    saveTimer: null,
+    ticker: null,
+    lit: [],
+    lastScrollAt: 0,
+    get rate() { return Number(localStorage.getItem('p.rate')) || 1; },
+    set rate(v) { localStorage.setItem('p.rate', String(v)); },
+    get follow() { return localStorage.getItem('p.follow') !== '0'; },
+    set follow(v) { localStorage.setItem('p.follow', v ? '1' : '0'); },
+    get captions() { return localStorage.getItem('p.captions') !== '0'; },
+    set captions(v) { localStorage.setItem('p.captions', v ? '1' : '0'); },
+  };
+
+  function decks() {
+    if (!player.decks) {
+      player.decks = [new Audio(), new Audio()];
+      for (const deck of player.decks) {
+        deck.preload = 'auto';
+        deck.addEventListener('ended', () => { if (deck === current()) afterSegment(); });
+        deck.addEventListener('loadedmetadata', () => reconcileDuration(deck));
+        deck.addEventListener('error', () => { if (deck === current() && deck.dataset.seq) segmentFailed(); });
+      }
+    }
+    return player.decks;
+  }
+  const current = () => decks()[player.deck];
+  const idle = () => decks()[1 - player.deck];
+
+  const segmentUrl = seq => appUrl(`/api/articles/${player.articleId}/narration/${seq}`);
+  const audible = segment => Boolean(segment) && (player.captions || segment.kind !== 'caption');
+
+  function unlockAudio() {
+    for (const deck of decks()) {
+      if (deck.dataset.seq) continue;
+      deck.src = SILENCE;
+      deck.play().then(() => deck.pause()).catch(() => {});
+    }
+  }
+
+  function toggleNarration() {
+    if (!state.current) return;
+    unlockAudio();
+    if (player.manifest && player.articleId === state.current.id) {
+      if (player.el.hidden) return showPlayer();
+      return stopNarration();
+    }
+    return startNarration();
+  }
+
+  async function startNarration({ voiceId, force } = {}) {
+    const article = state.current;
+    if (!article) return;
+    player.articleId = article.id;
+    showPlayer();
+    setNow(force ? 'recasting the narration…' : 'reading the article…');
+    setPlayIcon(false);
+    try {
+      const manifest = await fetchJson(`/api/articles/${article.id}/narration`, {
+        method: 'POST',
+        body: { voice_id: voiceId || undefined, force: force || undefined },
+      });
+      if (player.articleId !== article.id) return;   // reader moved on while we waited
+      adoptManifest(manifest);
+      const total = timeline().total;
+      const resume = manifest.audio_pos > 2 && manifest.audio_pos < total - 5 ? manifest.audio_pos : 0;
+      seekTo(resume, { play: true });
+    } catch (e) {
+      setNow(`narration failed: ${e.message}`, 'error');
+      setPlayIcon(false);
+    }
+  }
+
+  function adoptManifest(manifest) {
+    player.manifest = manifest;
+    // the server indexed every matching node of this same document, in order
+    player.blocks = [...$('a-body').querySelectorAll(BLOCK_SELECTOR)];
+    player.index = 0;
+    renderPanel();
+    updateTransport();
+  }
+
+  function showPlayer() {
+    player.el.hidden = false;
+    $('listen-btn').classList.add('on');
+    document.documentElement.dataset.listening = '1';
+  }
+
+  function stopNarration() {
+    pause();
+    clearHighlight();
+    player.el.hidden = true;
+    $('pl-panel').hidden = true;
+    $('pl-more').setAttribute('aria-expanded', 'false');
+    $('listen-btn').classList.remove('on');
+    delete document.documentElement.dataset.listening;
+  }
+
+  /* Leaving the article ends the session; the position is already on the server,
+     so reopening picks the narration back up where it stopped. */
+  function resetNarration() {
+    if (player.manifest) savePosition(elapsed(), { now: true });
+    clearTimeout(player.gapTimer);
+    clearInterval(player.ticker);
+    player.gapTimer = player.ticker = null;
+    if (player.decks) {
+      for (const deck of player.decks) {
+        deck.pause();
+        deck.removeAttribute('src');
+        delete deck.dataset.seq;
+      }
+    }
+    player.playing = false;
+    player.manifest = null;
+    player.articleId = null;
+    player.index = 0;
+    player.lit = [];
+    player.el.hidden = true;
+    $('pl-panel').hidden = true;
+    $('listen-btn').classList.remove('on');
+    delete document.documentElement.dataset.listening;
+  }
+
+  // ── transport ────────────────────────────────────────────────────────────
+  function play() {
+    if (!player.manifest) return;
+    player.playing = true;
+    setPlayIcon(true);
+    const deck = current();
+    if (deck.dataset.seq === String(player.index) && deck.src) {
+      deck.playbackRate = player.rate;
+      deck.play().catch(() => {});
+      startTicker();
+      preloadNext();
+      updateMediaSession();
+      return;
+    }
+    playSegment(player.index, 0);
+  }
+
+  function pause({ persist = true } = {}) {
+    player.playing = false;
+    setPlayIcon(false);
+    clearTimeout(player.gapTimer);
+    clearInterval(player.ticker);
+    player.ticker = null;
+    if (player.decks) for (const deck of player.decks) deck.pause();
+    if (persist && player.manifest) savePosition(elapsed());
+    updateMediaSession();
+  }
+
+  function togglePlay() {
+    if (!player.manifest) return startNarration();
+    return player.playing ? pause() : play();
+  }
+
+  async function playSegment(index, offset = 0) {
+    const segments = player.manifest?.segments || [];
+    if (index >= segments.length) return finish();
+    if (!audible(segments[index])) return playSegment(index + 1, 0);
+
+    clearTimeout(player.gapTimer);
+    for (const deck of decks()) deck.pause();
+    // the spare deck may already hold this segment from the prefetch
+    if (idle().dataset.seq === String(index) && current().dataset.seq !== String(index)) {
+      player.deck = 1 - player.deck;
+    }
+
+    player.index = index;
+    const deck = current();
+    if (deck.dataset.seq !== String(index)) {
+      deck.src = segmentUrl(index);
+      deck.dataset.seq = String(index);
+    }
+    deck.playbackRate = player.rate;
+    setTime(deck, offset);
+
+    highlight(index);
+    setNow(nowLabel(segments[index]));
+    if (player.playing) {
+      try { await deck.play(); } catch { /* refused until a gesture; the button still works */ }
+      startTicker();
+    }
+    preloadNext();
+    updateMediaSession();
+    updateTransport();
+  }
+
+  function setTime(deck, offset) {
+    const apply = () => { try { deck.currentTime = offset; } catch { /* not seekable yet */ } };
+    if (deck.readyState >= 1) apply();
+    else deck.addEventListener('loadedmetadata', apply, { once: true });
+  }
+
+  function afterSegment() {
+    const segments = player.manifest?.segments || [];
+    const gap = (segments[player.index]?.gap || 0) / player.rate;
+    savePosition(elapsed());
+    let next = player.index + 1;
+    while (next < segments.length && !audible(segments[next])) next += 1;
+    if (next >= segments.length) return finish();
+    clearTimeout(player.gapTimer);
+    player.gapTimer = setTimeout(() => playSegment(next, 0), gap);
+  }
+
+  function preloadNext() {
+    const segments = player.manifest?.segments || [];
+    let next = player.index + 1;
+    while (next < segments.length && !audible(segments[next])) next += 1;
+    if (next >= segments.length) return;
+    const spare = idle();
+    if (spare.dataset.seq === String(next)) return;
+    spare.src = segmentUrl(next);
+    spare.dataset.seq = String(next);
+    spare.load();
+  }
+
+  function segmentFailed() {
+    setNow('that passage would not synthesise — skipping it', 'error');
+    afterSegment();
+  }
+
+  function finish() {
+    pause({ persist: false });
+    setNow('finished');
+    savePosition(0, { now: true });
+    clearHighlight();
+    updateTransport();
+  }
+
+  // ── timeline ─────────────────────────────────────────────────────────────
+  /* Where each segment sits on one continuous clock, gaps included. Durations
+     start as the server's estimate and are replaced by the real thing as the
+     audio loads, so the bar tightens up rather than jumping. */
+  function timeline() {
+    const segments = player.manifest?.segments || [];
+    const marks = [];
+    let at = 0;
+    for (const segment of segments) {
+      marks.push(at);
+      if (audible(segment)) at += segment.duration + segment.gap / 1000;
+    }
+    return { marks, total: at };
+  }
+
+  function elapsed() {
+    if (!player.manifest) return 0;
+    return (timeline().marks[player.index] || 0) + (current().currentTime || 0);
+  }
+
+  function seekTo(seconds, { play: shouldPlay = false } = {}) {
+    if (!player.manifest) return;
+    const segments = player.manifest.segments;
+    const { marks, total } = timeline();
+    const target = Math.max(0, Math.min(seconds, Math.max(0, total - 0.5)));
+    let index = 0;
+    for (let i = 0; i < segments.length; i++) {
+      if (audible(segments[i]) && marks[i] <= target) index = i;
+    }
+    const offset = Math.max(0, Math.min(target - marks[index], Math.max(0, (segments[index]?.duration || 0) - 0.3)));
+    if (shouldPlay) { player.playing = true; setPlayIcon(true); }
+    playSegment(index, offset);
+  }
+
+  const jump = delta => seekTo(elapsed() + delta, { play: player.playing });
+
+  function startTicker() {
+    clearInterval(player.ticker);
+    player.ticker = setInterval(updateTransport, 250);
+  }
+
+  function updateTransport() {
+    if (!player.manifest) return;
+    const { total } = timeline();
+    const at = elapsed();
+    $('pl-time').textContent = `${clock(at)} / ${clock(total)}`;
+    const seek = $('pl-seek');
+    if (document.activeElement !== seek) seek.value = String(total ? Math.round((at / total) * 1000) : 0);
+    $('pl-rate').textContent = `${player.rate}×`;
+  }
+
+  function reconcileDuration(deck) {
+    const seq = Number(deck.dataset.seq);
+    const segment = player.manifest?.segments?.[seq];
+    if (!segment || !Number.isFinite(deck.duration) || deck.duration <= 0) return;
+    segment.duration = deck.duration;
+    segment.ready = true;
+    updateTransport();
+  }
+
+  // ── follow along ─────────────────────────────────────────────────────────
+  function highlight(index) {
+    clearHighlight();
+    const segment = player.manifest?.segments?.[index];
+    if (!segment) return;
+    const nodes = (segment.blocks || []).map(at => player.blocks[at]).filter(Boolean);
+    for (const node of nodes) node.classList.add('is-narrating');
+    player.lit = nodes;
+    // a reader who just scrolled somewhere is reading there; do not yank them back
+    if (!nodes.length || !player.follow || Date.now() - player.lastScrollAt < 4000) return;
+    const box = nodes[0].getBoundingClientRect();
+    const frame = scroller.getBoundingClientRect();
+    if (box.top < frame.top + 80 || box.bottom > frame.bottom - 140) {
+      scroller.scrollTo({
+        top: scroller.scrollTop + box.top - frame.top - frame.height * 0.32,
+        behavior: 'smooth',
+      });
+    }
+  }
+
+  function clearHighlight() {
+    for (const node of player.lit) node.classList.remove('is-narrating');
+    player.lit = [];
+  }
+
+  function nowLabel(segment) {
+    const voice = player.manifest?.voice;
+    const cast = voice?.name ? `${voice.name}${voice.tone ? ` · ${voice.tone}` : ''}` : '';
+    return { intro: 'opening', outro: 'closing', heading: 'section', quote: 'quotation', caption: 'caption' }[segment?.kind] || cast;
+  }
+
+  function setNow(message, kind) {
+    const now = $('pl-now');
+    now.textContent = message;
+    now.classList.toggle('error', kind === 'error');
+  }
+
+  function setPlayIcon(playing) {
+    const button = $('pl-play');
+    button.innerHTML = playing ? '&#10073;&#10073;' : '&#9654;';
+    button.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+  }
+
+  function clock(seconds) {
+    const total = Math.max(0, Math.round(seconds || 0));
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+  }
+
+  function savePosition(at, { now = false } = {}) {
+    if (!player.articleId || DEMO) return;
+    const id = player.articleId;
+    clearTimeout(player.saveTimer);
+    const send = () => api.patch(id, { audio_pos: Math.max(0, at || 0) }).catch(() => {});
+    if (now) send();
+    else player.saveTimer = setTimeout(send, 500);
+  }
+
+  // ── settings ─────────────────────────────────────────────────────────────
+  function renderPanel() {
+    const panel = $('pl-panel');
+    const voice = player.manifest?.voice || {};
+    const words = player.manifest?.pronunciations || [];
+    panel.innerHTML = `
+      <div class="pl-cast">
+        <span class="pl-cast-name">${esc(voice.name || 'default voice')}</span>
+        ${voice.tone ? `<span class="pl-chip">${esc(voice.tone)}</span>` : ''}
+        ${voice.source ? `<span class="pl-chip pl-chip-quiet">${esc(voice.source)}</span>` : ''}
+      </div>
+      ${voice.reason ? `<p class="pl-reason">${esc(voice.reason)}</p>` : ''}
+      ${words.length ? `<p class="pl-reason">said as: ${esc(words.map(w => `${w.find} → ${w.say}`).join(' · '))}</p>` : ''}
+      <div class="pl-toggles">
+        <label><input type="checkbox" id="pl-follow" ${player.follow ? 'checked' : ''}> follow along</label>
+        <label><input type="checkbox" id="pl-captions" ${player.captions ? 'checked' : ''}> read captions</label>
+      </div>
+      <div class="pl-actions">
+        <button class="linklike" id="pl-recast">recast</button>
+        <button class="linklike" id="pl-pick">choose a voice</button>
+      </div>
+      <div id="pl-voices" class="pl-voices" hidden></div>`;
+
+    panel.querySelector('#pl-follow').addEventListener('change', ev => { player.follow = ev.target.checked; });
+    panel.querySelector('#pl-captions').addEventListener('change', (ev) => {
+      player.captions = ev.target.checked;
+      updateTransport();
+    });
+    panel.querySelector('#pl-recast').addEventListener('click', () => startNarration({ force: true }));
+    panel.querySelector('#pl-pick').addEventListener('click', showVoicePicker);
+  }
+
+  async function showVoicePicker() {
+    const mount = $('pl-voices');
+    mount.hidden = false;
+    mount.textContent = 'loading voices…';
+    try {
+      const voices = await fetchJson(`/api/narration/voices?lang=${encodeURIComponent(player.manifest?.language || 'en')}`);
+      if (!voices.length) { mount.textContent = 'no voice catalogue available'; return; }
+      mount.innerHTML = voices.slice(0, 40).map(voice => `
+        <button class="pl-voice" data-voice="${esc(voice.id)}" title="${esc(voice.description || '')}">
+          <span class="pl-voice-name">${esc(voice.title)}</span>
+          <span class="pl-voice-tags">${esc((voice.tags || []).slice(0, 4).join(' · '))}</span>
+        </button>`).join('');
+      mount.onclick = (ev) => {
+        const button = ev.target.closest('[data-voice]');
+        if (!button) return;
+        mount.hidden = true;
+        startNarration({ voiceId: button.dataset.voice, force: true });
+      };
+    } catch (e) {
+      mount.textContent = `voices unavailable: ${e.message}`;
+    }
+  }
+
+  function updateMediaSession() {
+    if (!('mediaSession' in navigator) || !state.current) return;
+    const article = state.current;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: article.title || 'particle',
+        artist: article.byline || article.site_name || 'particle',
+        album: article.site_name || 'particle',
+        artwork: article.lead_image
+          ? [{ src: appUrl(`/api/image?url=${encodeURIComponent(article.lead_image)}`), sizes: '512x512' }]
+          : [],
+      });
+      navigator.mediaSession.playbackState = player.playing ? 'playing' : 'paused';
+    } catch { /* metadata is a nicety */ }
+    const bind = (action, handler) => {
+      try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* unsupported action */ }
+    };
+    bind('play', play);
+    bind('pause', () => pause());
+    bind('seekbackward', () => jump(-SKIP_SECONDS));
+    bind('seekforward', () => jump(SKIP_SECONDS));
+    bind('nexttrack', () => afterSegment());
+    bind('previoustrack', () => seekTo(timeline().marks[Math.max(0, player.index - 1)] || 0, { play: player.playing }));
+  }
+
+  // ── wiring ───────────────────────────────────────────────────────────────
+  $('listen-btn').addEventListener('click', toggleNarration);
+  $('pl-play').addEventListener('click', () => { unlockAudio(); togglePlay(); });
+  $('pl-back').addEventListener('click', () => jump(-SKIP_SECONDS));
+  $('pl-fwd').addEventListener('click', () => jump(SKIP_SECONDS));
+  $('pl-close').addEventListener('click', stopNarration);
+  $('pl-rate').addEventListener('click', () => {
+    player.rate = RATES[(RATES.indexOf(player.rate) + 1) % RATES.length] || 1;
+    for (const deck of decks()) deck.playbackRate = player.rate;
+    updateTransport();
+  });
+  $('pl-more').addEventListener('click', () => {
+    const panel = $('pl-panel');
+    panel.hidden = !panel.hidden;
+    $('pl-more').setAttribute('aria-expanded', String(!panel.hidden));
+  });
+  $('pl-seek').addEventListener('input', (ev) => {
+    const { total } = timeline();
+    $('pl-time').textContent = `${clock((Number(ev.target.value) / 1000) * total)} / ${clock(total)}`;
+  });
+  $('pl-seek').addEventListener('change', (ev) => {
+    const { total } = timeline();
+    seekTo((Number(ev.target.value) / 1000) * total, { play: player.playing });
+  });
+
+  // A tap on a paragraph while the player is open reads from there.
+  $('a-body').addEventListener('click', (ev) => {
+    if (!player.manifest || player.el.hidden || ev.target.closest('a, button')) return;
+    let block = ev.target.closest(BLOCK_SELECTOR);
+    if (!block) return;
+    for (let up = block.parentElement?.closest(BLOCK_SELECTOR); up; up = up.parentElement?.closest(BLOCK_SELECTOR)) {
+      block = up;
+    }
+    const blockIndex = player.blocks.indexOf(block);
+    const index = player.manifest.segments.findIndex(segment => (segment.blocks || []).includes(blockIndex));
+    if (blockIndex < 0 || index < 0) return;
+    unlockAudio();
+    player.playing = true;
+    setPlayIcon(true);
+    playSegment(index, 0);
+  });
+
+  scroller.addEventListener('scroll', () => { player.lastScrollAt = Date.now(); }, { passive: true });
+
   // ── helpers ──────────────────────────────────────────────────────────────
   function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -595,6 +1097,17 @@
 
   function appHome() {
     return `${BASE}/` || '/';
+  }
+
+  // Narration needs a text-to-speech key on the server; without one the reader
+  // never offers it.
+  if (!DEMO) {
+    fetchJson('/api/health')
+      .then((health) => {
+        state.narration = Boolean(health.narration);
+        if (state.narration && !reader.hidden) $('listen-btn').hidden = false;
+      })
+      .catch(() => {});
   }
 
   // ── pwa ──────────────────────────────────────────────────────────────────

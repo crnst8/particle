@@ -1,6 +1,6 @@
 /* particle service worker — app shell offline + read-offline for visited articles */
-const SHELL = 'particle-shell-v3';
-const RUNTIME = 'particle-runtime-v3';
+const SHELL = 'particle-shell-v4';
+const RUNTIME = 'particle-runtime-v4';
 const BASE = new URL(self.registration.scope).pathname.replace(/\/$/, '');
 const at = path => `${BASE}${path}` || '/';
 // Keep this list to assets that always exist — cache.addAll() rejects as a whole
@@ -33,6 +33,10 @@ self.addEventListener('fetch', (e) => {
     e.respondWith(fetch(request).catch(() => caches.match(at('/'))));
     return;
   }
+
+  // Narration audio is large and already cached in SQLite on the server; keep it
+  // out of the offline store and let the HTTP cache handle repeats.
+  if (/\/narration\/\d+$/.test(url.pathname)) return;
 
   // API + images: network first, fall back to last good copy (offline reading)
   if (url.pathname.startsWith(at('/api/'))) {

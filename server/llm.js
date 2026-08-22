@@ -65,3 +65,66 @@ Reply with JSON only: {"quality": "...", "note": "...", "tags": ["..."]}`,
     : [];
   return { quality, note: String(parsed.note || ''), tags };
 }
+
+/**
+ * Direct the narration of one article: which catalogue voice reads it, how fast,
+ * how expressively, what the spoken opening line is, and how to say the handful
+ * of names and terms a text-to-speech model would otherwise mangle.
+ * Returns null-ish fields freely; the caller validates and falls back.
+ */
+export async function directNarration({ article, language, profile, minutes, candidates }) {
+  const text = article.text_content || '';
+  const opening = text.slice(0, 1100);
+  const middle = text.length > 3000 ? text.slice(Math.floor(text.length / 2), Math.floor(text.length / 2) + 500) : '';
+  const roster = candidates.map(v => `- ${v.id} | ${v.title} | ${v.tags}${v.description ? ` | ${v.description}` : ''}`).join('\n');
+
+  const reply = await chat([
+    {
+      role: 'system',
+      content: 'You cast and direct audiobook narrators. You are given one article and a roster of real voices. '
+        + 'Pick the voice a thoughtful audio editor would choose for this specific piece, and direct its delivery. '
+        + 'Respond with strict JSON, nothing else.',
+    },
+    {
+      role: 'user',
+      content: `Article to narrate:
+Title: ${article.title}
+Byline: ${article.byline || 'unknown'}
+Site: ${article.site_name || 'unknown'}
+Topic tags: ${(article.tags || []).join(', ') || 'none'}
+Language: ${language}
+Length: ${article.word_count} words, about ${minutes} minutes read
+Heuristic tone guess: ${profile}
+
+Opening:
+${opening}
+${middle ? `\nFrom the middle:\n${middle}` : ''}
+
+Voice roster (id | name | tags | description):
+${roster || '(none available — leave voice_id null)'}
+
+Decide:
+1. voice_id: the id of the best voice on that roster for this piece, verbatim. Match register to content: reportage wants clarity and authority, personal essays want warmth, technical pieces want an even, unhurried teacher. Never pick a character or performance voice for serious writing.
+2. tone: two or three lowercase words describing the delivery you want (e.g. "calm, measured").
+3. speed: 0.85-1.15. Dense or technical prose reads slower; brisk news reads slightly faster.
+4. temperature: 0.4-0.9. Lower is steadier and more neutral, higher is more expressive.
+5. intro: one short spoken line to open the audio, in ${language}. Name the publication, the title and the author naturally, as a radio host would, and say roughly how long it runs. No markup, no quotation marks around the title, under 200 characters.
+6. pronunciations: up to 8 replacements for words this article uses that a text-to-speech model would say wrongly — acronyms that must be spelled out, foreign or unusual proper nouns, product names, units. Each is {"find": "<exact text as written>", "say": "<phonetic respelling in plain letters>"}. Only include genuinely risky ones; an empty list is a fine answer.
+7. reason: one short sentence on why this casting suits the article.
+
+Reply with JSON only:
+{"voice_id":"...","tone":"...","speed":1.0,"temperature":0.7,"intro":"...","pronunciations":[{"find":"...","say":"..."}],"reason":"..."}`,
+    },
+  ], { maxTokens: 1500 });
+
+  const parsed = parseJsonLoose(reply);
+  return {
+    voice_id: typeof parsed.voice_id === 'string' ? parsed.voice_id.trim() : null,
+    tone: parsed.tone,
+    speed: Number(parsed.speed),
+    temperature: Number(parsed.temperature),
+    intro: parsed.intro,
+    pronunciations: parsed.pronunciations,
+    reason: parsed.reason,
+  };
+}

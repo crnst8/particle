@@ -74,6 +74,7 @@ __PARTICLE_ANALYTICS__
         <button id="font-larger" class="bar-btn" title="Larger text">A+</button>
         <button id="font-face" class="bar-btn" title="Toggle serif / sans">Aa</button>
         <button id="theme-btn" class="bar-btn" title="Theme: light / sepia / dark">&#9680;</button>
+        <button id="listen-btn" class="bar-btn" title="Listen (l)" hidden>&#9834;</button>
         <button id="fav-btn" class="bar-btn" title="Favorite (f)">&#9734;</button>
         <button id="archive-btn" class="bar-btn" title="Archive (e)">&#8615;</button>
       </div>
@@ -101,6 +102,27 @@ __PARTICLE_ANALYTICS__
           <a href="https://github.com/crnst8/particle">Self-host particle →</a>
         </p>
       </div>
+    </div>
+
+    <!-- ── Narration player ─────────────────────────────────────── -->
+    <div id="player" class="player" hidden>
+      <div class="player-row">
+        <button id="pl-play" class="pl-btn pl-play" title="Play / pause (space)" aria-label="Play">&#9654;</button>
+        <button id="pl-back" class="pl-btn pl-skip" title="Back 15 seconds" aria-label="Back 15 seconds">&#8630;</button>
+        <button id="pl-fwd" class="pl-btn pl-skip" title="Forward 15 seconds" aria-label="Forward 15 seconds">&#8631;</button>
+        <div class="pl-track">
+          <input id="pl-seek" class="pl-seek" type="range" min="0" max="1000" step="1" value="0"
+                 aria-label="Narration position">
+          <div class="pl-line">
+            <span id="pl-time" class="pl-time">0:00 / 0:00</span>
+            <span id="pl-now" class="pl-now" aria-live="polite"></span>
+          </div>
+        </div>
+        <button id="pl-rate" class="pl-btn pl-rate" title="Playback speed">1&times;</button>
+        <button id="pl-more" class="pl-btn" title="Narration settings" aria-expanded="false">&#8943;</button>
+        <button id="pl-close" class="pl-btn" title="Stop listening">&times;</button>
+      </div>
+      <div id="pl-panel" class="pl-panel" hidden></div>
     </div>
   </article>
 </div>
