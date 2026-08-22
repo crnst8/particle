@@ -24,6 +24,7 @@ const SNAPSHOT_MAX_BYTES = positiveInt(process.env.SNAPSHOT_MAX_BYTES, 8 * 1024 
 const pub = join(__dirname, '..', 'public');
 const landing = join(__dirname, '..', 'landing');
 const demo = join(__dirname, '..', 'demo');
+const VERSION = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
 const shellTemplate = readFileSync(join(pub, 'index.html'), 'utf8');
 const manifestTemplate = JSON.parse(readFileSync(join(pub, 'manifest.webmanifest'), 'utf8'));
 const store = DEMO_MODE ? null : await import('./db.js');
@@ -52,7 +53,7 @@ app.use(express.json({ limit: '1mb' }));
 
 // ── API ──────────────────────────────────────────────────────────────────────
 
-app.get(api('/health'), (_req, res) => res.json({ ok: true, app: 'particle', demo: DEMO_MODE }));
+app.get(api('/health'), (_req, res) => res.json({ ok: true, app: 'particle', version: VERSION, demo: DEMO_MODE }));
 
 if (DEMO_MODE) {
   const extractLimit = rateLimit({ limit: positiveInt(process.env.DEMO_EXTRACTS_PER_MINUTE, 10) });

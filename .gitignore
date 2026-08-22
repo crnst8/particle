@@ -6,3 +6,5 @@ data/
 
 # Drop-in UI font (see public/style.css) — never commit licensed font files.
 public/fonts/
+.publish.env
+publish.sh

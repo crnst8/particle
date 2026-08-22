@@ -1,0 +1,38 @@
+# Paths ./publish.sh refuses to find in git.
+# One glob per line, matched against the path relative to the repo root.
+# `dir/*` also matches everything below dir. A leading ! makes an exception.
+#
+# .gitignore keeps these out of a commit. This list is the second lock: if one
+# of them is ever tracked anyway, the publish stops instead of pushing it.
+
+# Real configuration, as opposed to the example.
+.env
+.env.*
+!.env.example
+
+# Local state: the SQLite library, dev logs, this script's own settings.
+data/*
+.dev/*
+.publish.env
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Credentials of any shape.
+*.pem
+*.p12
+*.pfx
+*.key
+id_rsa
+id_ed25519
+.netrc
+
+# Licensed font files — see public/style.css.
+public/fonts/*
+
+# Machine leftovers.
+.DS_Store
+*/.DS_Store
+node_modules/*
