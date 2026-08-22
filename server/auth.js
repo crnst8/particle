@@ -62,7 +62,7 @@ h1{font-size:1.3rem;margin:0 0 1.5rem}form{display:flex;border-bottom:2px solid 
 </main></body></html>`;
 }
 
-export function createAuth({ base = '', dbPath, persistSecret = true } = {}) {
+export function createAuth({ base = '', dbPath, persistSecret = true, openPaths = [] } = {}) {
   const password = process.env.PARTICLE_PASSWORD || '';
   if (!password) return (_req, _res, next) => next();
 
@@ -74,7 +74,8 @@ export function createAuth({ base = '', dbPath, persistSecret = true } = {}) {
 
   return (req, res, next) => {
     const inApp = !base || req.path === base || req.path.startsWith(`${base}/`);
-    if (!inApp || req.path === healthPath) return next();
+    // openPaths carry their own single-use token instead of the session cookie.
+    if (!inApp || req.path === healthPath || openPaths.includes(req.path)) return next();
 
     if (req.path === logoutPath) {
       res.clearCookie(COOKIE_NAME, { path: cookiePath });

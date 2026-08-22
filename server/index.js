@@ -5,6 +5,8 @@ import { dirname, extname, join } from 'node:path';
 import { createAuth } from './auth.js';
 import { createDemoSeed, rateLimit } from './demo.js';
 import { extractArticle, normalizeUrl, BROWSER_UA } from './extract.js';
+import { findArchiveSnapshot, parseArchiveUrl } from './archive-today.js';
+import { claimTicket, createTicket, readTicket, settleTicket } from './handoff.js';
 import { isLlmConfigured, assessArticle } from './llm.js';
 import { safeFetch } from './net.js';
 
@@ -15,6 +17,9 @@ const BASE = normalizeBase(process.env.PARTICLE_BASE || '');
 const DB_PATH = process.env.PARTICLE_DB || new URL('../data/particle.db', import.meta.url).pathname;
 const IMAGE_MAX_BYTES = positiveInt(process.env.IMAGE_MAX_BYTES, 8 * 1024 * 1024);
 const DEMO_MAX_ARTICLES = positiveInt(process.env.DEMO_MAX_ARTICLES, 15);
+// Page source handed back by the browser after a human clears an archive.today
+// captcha. Snapshots are much larger than an ordinary API body.
+const SNAPSHOT_MAX_BYTES = positiveInt(process.env.SNAPSHOT_MAX_BYTES, 8 * 1024 * 1024);
 
 const pub = join(__dirname, '..', 'public');
 const landing = join(__dirname, '..', 'landing');
@@ -26,12 +31,24 @@ const store = DEMO_MODE ? null : await import('./db.js');
 const app = express();
 app.disable('x-powered-by');
 if (process.env.PARTICLE_TRUST_PROXY === '1') app.set('trust proxy', 1);
-app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false, limit: '16kb' }));
-app.use(createAuth({ base: BASE, dbPath: DB_PATH, persistSecret: !DEMO_MODE }));
+app.use(createAuth({
+  base: BASE, dbPath: DB_PATH, persistSecret: !DEMO_MODE,
+  // The bookmarklet posts from an archive.today tab and authorises itself with
+  // a single-use ticket, so no session cookie reaches this one route.
+  openPaths: [`${BASE}/api/handoff`],
+}));
 
 const pathAt = path => `${BASE}${path}` || '/';
 const api = path => pathAt(`/api${path}`);
+
+// Routes that accept pasted/fetched page source get a bigger body budget; they
+// sit behind auth so the allowance is not open to the internet.
+app.post([api('/extract'), api('/articles'), api('/articles/:id/refetch')],
+  express.json({ limit: SNAPSHOT_MAX_BYTES }));
+// The bookmarklet posts cross-origin, so it sends a CORS-simple text body.
+app.post(api('/handoff'), express.text({ limit: SNAPSHOT_MAX_BYTES, type: '*/*' }));
+app.use(express.json({ limit: '1mb' }));
 
 // ── API ──────────────────────────────────────────────────────────────────────
 
@@ -47,7 +64,7 @@ if (DEMO_MODE) {
 
   app.post(api('/extract'), extractLimit, async (req, res) => {
     try {
-      res.json(await extractArticle(req.body?.url));
+      res.json(await extractArticle(req.body?.url, pageSource(req.body)));
     } catch (error) {
       extractionError(res, error);
     }
@@ -57,6 +74,74 @@ if (DEMO_MODE) {
 } else {
   registerLibraryRoutes(app);
 }
+
+// Where archive.today keeps a snapshot of this article. Answering this needs no
+// captcha, so the browser can fetch the snapshot itself when the server is blocked.
+app.get(api('/archive-snapshot'), DEMO_MODE ? rateLimit({ limit: 30 }) : (_req, _res, next) => next(),
+  async (req, res) => {
+    let target;
+    try {
+      target = normalizeUrl(req.query.url);
+    } catch {
+      return res.status(400).json({ error: 'invalid url' });
+    }
+    const pasted = typeof req.query.url === 'string' ? parseArchiveUrl(req.query.url) : null;
+    const snapshotUrl = pasted?.snapshotUrl || await findArchiveSnapshot(target);
+    if (!snapshotUrl) return res.status(404).json({ error: 'archive.today has no snapshot of that page' });
+    res.json({ snapshot_url: snapshotUrl, original_url: target });
+  });
+
+// ── captcha handoff ─────────────────────────────────────────────────────────
+// One ticket admits one delivery of page source from another origin. The
+// bookmarklet carries the token, so the archive.today session that cleared the
+// captcha is the one that reads the page — which a cookieless fetch cannot do.
+app.post(api('/handoff/tickets'), (req, res) => {
+  let url;
+  try {
+    url = normalizeUrl(req.body?.url);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  res.json({ ...createTicket(url), endpoint: `${req.protocol}://${req.get('host')}${api('/handoff')}` });
+});
+
+app.options(api('/handoff'), (_req, res) => {
+  handoffCors(res);
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
+app.post(api('/handoff'), rateLimit({ limit: 20 }), async (req, res) => {
+  handoffCors(res);
+  let payload;
+  try {
+    payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+  } catch {
+    payload = null;
+  }
+  if (!payload?.token || typeof payload.html !== 'string' || !payload.html.trim()) {
+    return res.status(400).json({ error: 'send { token, url, html }' });
+  }
+
+  const ticket = claimTicket(payload.token);
+  if (!ticket) return res.status(404).json({ error: 'that particle handoff has expired — reopen the panel' });
+
+  try {
+    const extracted = await extractArticle(ticket.url, {
+      html: payload.html,
+      sourceUrl: typeof payload.url === 'string' ? payload.url : undefined,
+    });
+    const article = DEMO_MODE ? extracted : saveExtracted(extracted);
+    settleTicket(payload.token, { article });
+    res.json({ ok: true, title: article.title });
+  } catch (error) {
+    settleTicket(payload.token, { error: error.message });
+    res.status(422).json({ error: error.message });
+  }
+});
+
+app.get(api('/handoff/:token'), (req, res) => res.json(readTicket(req.params.token)));
 
 // Image proxy: strips Referer so hotlink-protected article images still load.
 // Every redirect is revalidated by safeFetch and the body is capped while read.
@@ -161,14 +246,25 @@ function registerLibraryRoutes(router) {
       return res.status(400).json({ error: error.message });
     }
 
+    const source = pageSource(req.body);
     const existing = store.getByUrl(url);
-    if (existing) return res.json({ ...store.getArticle(existing.id), duplicate: true });
+    // Page source for an article already in the library rewrites it in place —
+    // that is the captcha rescue finishing a save that came back partial.
+    if (existing && !source.html) return res.json({ ...store.getArticle(existing.id), duplicate: true });
 
     try {
-      const extracted = await extractArticle(url);
+      const extracted = await extractArticle(url, source);
+      // A short-code snapshot resolves to the story's own URL, which may already be filed.
+      const filed = extracted.url === url ? existing : store.getByUrl(extracted.url);
+      if (filed) {
+        const updated = store.replaceArticleContent(filed.id, extracted);
+        res.json(withChallenge(updated, extracted));
+        if (isLlmConfigured) enrichInBackground(filed.id);
+        return;
+      }
       const saved = store.insertArticle(extracted);
       if (extracted.quality_note) store.updateArticle(saved.id, { quality_note: extracted.quality_note });
-      res.status(201).json(store.getArticle(saved.id));
+      res.status(201).json(withChallenge(store.getArticle(saved.id), extracted));
       if (isLlmConfigured) enrichInBackground(saved.id);
     } catch (error) {
       extractionError(res, error);
@@ -179,9 +275,9 @@ function registerLibraryRoutes(router) {
     const article = store.getArticle(Number(req.params.id));
     if (!article) return res.status(404).json({ error: 'not found' });
     try {
-      const extracted = await extractArticle(article.url);
+      const extracted = await extractArticle(article.url, pageSource(req.body));
       const updated = store.replaceArticleContent(article.id, extracted);
-      res.json(updated);
+      res.json(withChallenge(updated, extracted));
       if (isLlmConfigured) enrichInBackground(article.id);
     } catch (error) {
       extractionError(res, error);
@@ -247,7 +343,41 @@ function renderShell() {
 
 function extractionError(res, error) {
   const status = error?.statusCode || (error?.code === 'ERR_PRIVATE_ADDRESS' ? 403 : 422);
-  res.status(status).json({ error: error?.message || 'article extraction failed' });
+  const payload = { error: error?.message || 'article extraction failed' };
+  // 428 carries the snapshot a reader can unlock by hand; the app offers to retry with it.
+  if (error?.challenge) payload.challenge = error.challenge;
+  res.status(status).json(payload);
+}
+
+// Page source the browser fetched (or a reader pasted) instead of the server.
+function pageSource(body) {
+  const html = typeof body?.html === 'string' && body.html.trim() ? body.html : undefined;
+  const sourceUrl = typeof body?.source_url === 'string' ? body.source_url : undefined;
+  return html ? { html, sourceUrl } : {};
+}
+
+function handoffCors(res) {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Vary', 'Origin');
+}
+
+/* File an article the bookmarklet delivered, rewriting the row in place when the
+   same story is already saved — that is a partial extraction being rescued. */
+function saveExtracted(extracted) {
+  const existing = store.getByUrl(extracted.url);
+  if (existing) {
+    const updated = store.replaceArticleContent(existing.id, extracted);
+    if (isLlmConfigured) enrichInBackground(existing.id);
+    return updated;
+  }
+  const saved = store.insertArticle(extracted);
+  if (extracted.quality_note) store.updateArticle(saved.id, { quality_note: extracted.quality_note });
+  if (isLlmConfigured) enrichInBackground(saved.id);
+  return store.getArticle(saved.id);
+}
+
+function withChallenge(article, extracted) {
+  return extracted?.challenge ? { ...article, challenge: extracted.challenge } : article;
 }
 
 async function enrichInBackground(id) {

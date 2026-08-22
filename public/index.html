@@ -37,6 +37,7 @@ __PARTICLE_ANALYTICS__
         <button id="save-btn" type="submit">save</button>
       </form>
       <div id="save-status" class="save-status" role="status" aria-live="polite"></div>
+      <div id="rescue" class="rescue" role="status" aria-live="polite" hidden></div>
       <div id="demo-nudge" class="demo-nudge" hidden>
         Want this library everywhere? Run your own copy:
         <code>docker run -d -p 4747:4747 -v particle-data:/app/data ghcr.io/crnst8/particle:latest</code>
@@ -84,6 +85,7 @@ __PARTICLE_ANALYTICS__
           <h1 class="article-title" id="a-title"></h1>
           <p class="article-meta" id="a-meta"></p>
           <div class="article-note" id="a-note" hidden></div>
+          <div class="rescue" id="reader-rescue" role="status" aria-live="polite" hidden></div>
         </header>
         <div class="article-body" id="a-body"></div>
         <footer class="article-foot">

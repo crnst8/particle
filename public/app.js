@@ -38,9 +38,9 @@
   const serverStore = {
     list: (q, filter) => fetchJson(`/api/articles?filter=${filter}&q=${encodeURIComponent(q || '')}`),
     get: (id) => fetchJson(`/api/articles/${id}`),
-    save: (url) => fetchJson('/api/articles', { method: 'POST', body: { url } }),
+    save: (url, source) => fetchJson('/api/articles', { method: 'POST', body: { url, ...sourceBody(source) } }),
     patch: (id, body) => fetchJson(`/api/articles/${id}`, { method: 'PATCH', body }),
-    refetch: (id) => fetchJson(`/api/articles/${id}/refetch`, { method: 'POST' }),
+    refetch: (id, source) => fetchJson(`/api/articles/${id}/refetch`, { method: 'POST', body: sourceBody(source) }),
     remove: (id) => fetchJson(`/api/articles/${id}`, { method: 'DELETE' }),
   };
   const api = DEMO
@@ -54,12 +54,23 @@
       body: body ? JSON.stringify(body) : undefined,
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok) {
+      const error = new Error(data.error || `HTTP ${res.status}`);
+      error.status = res.status;
+      error.data = data;
+      throw error;
+    }
     return data;
+  }
+
+  // Page source this browser fetched (or the reader pasted) after clearing a captcha.
+  function sourceBody(source) {
+    return source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {};
   }
 
   // ── routing ──────────────────────────────────────────────────────────────
   function route() {
+    stopAllPolling();
     const path = BASE && location.pathname.startsWith(BASE)
       ? location.pathname.slice(BASE.length) || '/'
       : location.pathname;
@@ -153,12 +164,20 @@
     saveBtn.disabled = true;
     saveStatus.classList.remove('error');
     saveStatus.textContent = 'extracting…';
+    $('rescue').hidden = true;
     try {
       const a = await api.save(url);
       urlInput.value = '';
       saveStatus.textContent = a.duplicate ? 'already in your library'
         : a.evicted_title ? `saved “${a.title}” · removed oldest article “${a.evicted_title}”`
           : `saved “${a.title}”`;
+      if (a.challenge) {
+        offerRescue({
+          url: a.url, articleId: a.id, challenge: a.challenge, mount: $('rescue'),
+          head: 'partial extraction. archive.today may hold a fuller snapshot.',
+          onDone: saved => { saveStatus.textContent = `re-extracted “${saved.title}”`; refresh(); },
+        });
+      }
       if (DEMO && !a.duplicate && !localStorage.getItem('p.demo.selfhost-nudge')) {
         $('demo-nudge').hidden = false;
         localStorage.setItem('p.demo.selfhost-nudge', '1');
@@ -174,6 +193,24 @@
         saveStatus.textContent = e.message;
       }
       saveStatus.classList.add('error');
+      // 428 means a snapshot is known and blocked, so go straight at it. Any other
+      // failed extraction just gets the offer; the snapshot may not exist.
+      const rescuable = e.status === 428 || e.status === 422;
+      if (rescuable) {
+        urlInput.value = '';
+        const target = e.data?.challenge?.original_url || url;
+        const onDone = saved => {
+          saveStatus.classList.remove('error');
+          saveStatus.textContent = `saved “${saved.title}” from archive.today`;
+          refresh();
+        };
+        if (e.data?.challenge) {
+          saveStatus.textContent = 'source blocked; trying archive.today';
+          startRescue({ url: target, challenge: e.data.challenge, mount: $('rescue'), onDone });
+        } else {
+          offerRescue({ url: target, mount: $('rescue'), onDone });
+        }
+      }
     } finally {
       saveBtn.disabled = false;
     }
@@ -217,10 +254,15 @@
     $('a-meta').innerHTML = meta.join('<span class="sep">&middot;</span>');
 
     const note = $('a-note');
+    $('reader-rescue').hidden = true;
+    $('reader-rescue').innerHTML = '';
     if (a.quality === 'partial' || a.quality === 'stub') {
       note.hidden = false;
-      note.innerHTML = `this extraction may be incomplete${a.quality_note ? ' — ' + esc(a.quality_note) : ''}. <button id="note-refetch">try again</button>`;
+      note.innerHTML = `this extraction may be incomplete${a.quality_note ? ' — ' + esc(a.quality_note) : ''}. <button id="note-refetch">try again</button> <button id="note-archive">try archive.today</button>`;
       note.querySelector('#note-refetch').addEventListener('click', () => doRefetch(a.id));
+      note.querySelector('#note-archive').addEventListener('click', () => startRescue({
+        url: a.url, articleId: a.id, mount: $('reader-rescue'), onDone: () => openReader(a.id),
+      }));
     } else {
       note.hidden = true;
     }
@@ -351,6 +393,181 @@
       body: JSON.stringify({ progress: p }),
     }).catch(() => {});
   });
+
+  // ── archive.today rescue ─────────────────────────────────────────────────
+  // The mirrors rate-limit by IP, gate on a captcha cookie and do not send CORS
+  // headers on a served snapshot, so neither the server nor this page can be
+  // relied on to read one. Both are tried; the page source is otherwise supplied
+  // from the archive.today tab itself, by bookmarklet or by paste.
+  const CHALLENGED = /<title>\s*archive\.[a-z]{2,6}\s*<\/title>/i;
+  const polling = new Set();
+
+  async function startRescue({ url, articleId, challenge, mount, onDone }) {
+    stopAllPolling();
+    const session = { url, articleId, mount, onDone, snapshotUrl: challenge?.snapshot_url || '' };
+    mount.hidden = false;
+    if (!session.snapshotUrl) {
+      say(mount, 'locating snapshot…');
+      try {
+        const found = await fetchJson(`/api/archive-snapshot?url=${encodeURIComponent(url)}`);
+        session.snapshotUrl = found.snapshot_url;
+      } catch (e) {
+        return say(mount, e.message, 'error');
+      }
+    }
+    return tryRescue(session, { allowServerRetry: false });
+  }
+
+  async function tryRescue(session, { allowServerRetry }) {
+    const { mount } = session;
+    say(mount, 'fetching snapshot…');
+    const page = await fetchSnapshot(session.snapshotUrl);
+
+    if (!page && allowServerRetry) {
+      say(mount, 'retrying from the server…');
+      try { return await finishRescue(session, null); } catch { /* still blocked */ }
+    }
+    if (!page) return renderChallenge(session);
+
+    say(mount, 'parsing snapshot…');
+    try {
+      await finishRescue(session, { html: page.html, sourceUrl: page.finalUrl });
+    } catch (e) {
+      renderChallenge(session, e.message);
+    }
+  }
+
+  async function finishRescue(session, source) {
+    const saved = session.articleId
+      ? await api.refetch(session.articleId, source)
+      : await api.save(session.url, source);
+    session.mount.hidden = true;
+    session.mount.innerHTML = '';
+    session.onDone(saved);
+    return saved;
+  }
+
+  async function fetchSnapshot(snapshotUrl) {
+    try {
+      const res = await fetch(snapshotUrl, { credentials: 'omit', redirect: 'follow' });
+      const html = await res.text();
+      if (!res.ok || CHALLENGED.test(html.slice(0, 4000))) return null;
+      return { html, finalUrl: res.url || snapshotUrl };
+    } catch {
+      return null; // CORS or network: fall back to supplying the source by hand
+    }
+  }
+
+  /* Neither fetch could read the snapshot. The page source has to come out of
+     the archive.today tab itself: by bookmarklet, or pasted. */
+  async function renderChallenge(session, error) {
+    const { mount } = session;
+    stopPolling(session);
+    mount.hidden = false;
+    mount.innerHTML = '<p class="rescue-head">preparing handoff…</p>';
+
+    let ticket = null;
+    try {
+      ticket = await fetchJson('/api/handoff/tickets', { method: 'POST', body: { url: session.url } });
+    } catch { /* no ticket: pasting still works */ }
+
+    mount.innerHTML = `
+      <p class="rescue-head">can't fetch this snapshot. supply the page source:</p>
+      ${error ? `<p class="rescue-error">${esc(error)}</p>` : ''}
+      <ol class="rescue-steps">
+        <li><a class="rescue-link" href="${esc(session.snapshotUrl)}" target="_blank" rel="noopener">open snapshot &#8599;</a></li>
+        <li>wait for the article. solve the captcha if one appears</li>
+        ${ticket ? `<li>click <a class="rescue-link rescue-bookmarklet" href="${bookmarkletHref(ticket)}">send page to particle</a>
+          <span class="rescue-hint">(drag to bookmarks bar first)</span></li>` : ''}
+      </ol>
+      ${ticket ? '<p class="rescue-wait">waiting for page…</p>' : ''}
+      <form class="rescue-manual">
+        <label>or paste it: view source, select all, copy.</label>
+        <textarea rows="3" spellcheck="false" placeholder="page source, or the article text"></textarea>
+        <div class="rescue-buttons">
+          <button class="rescue-submit" type="submit">use this source</button>
+          <button class="rescue-go" type="button">retry fetch</button>
+        </div>
+      </form>
+      <p class="rescue-note">Bookmarklet: desktop only, and blocked from an https page to a
+        plain http particle. Paste always works; on mobile, copy the article text.</p>`;
+
+    mount.querySelector('.rescue-go').addEventListener('click', () => {
+      tryRescue(session, { allowServerRetry: true });
+    });
+    mount.querySelector('.rescue-bookmarklet')?.addEventListener('click', (ev) => {
+      // Clicked here it would only ever read particle's own page.
+      ev.preventDefault();
+      const wait = mount.querySelector('.rescue-wait');
+      if (wait) wait.textContent = 'drag it to the bookmarks bar, then click it on the archive.today tab';
+    });
+    mount.querySelector('.rescue-manual').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const html = ev.target.querySelector('textarea').value.trim();
+      if (!html) return;
+      stopPolling(session);
+      say(mount, 'parsing source…');
+      try {
+        await finishRescue(session, { html, sourceUrl: session.snapshotUrl });
+      } catch (e) {
+        renderChallenge(session, e.message);
+      }
+    });
+    if (ticket) pollTicket(session, ticket.token);
+  }
+
+  function bookmarkletHref(ticket) {
+    const code = `(function(){var b={token:${JSON.stringify(ticket.token)},url:location.href,`
+      + 'html:document.documentElement.outerHTML};'
+      + `fetch(${JSON.stringify(ticket.endpoint)},{method:'POST',headers:{'Content-Type':'text/plain'},`
+      + 'body:JSON.stringify(b)}).then(function(r){return r.json()}).then(function(j){'
+      + "alert(j.error?'particle: '+j.error:'particle saved: '+(j.title||'ok'))})"
+      + ".catch(function(e){alert('particle could not be reached: '+e)})})()";
+    return 'javascript:' + encodeURIComponent(code);
+  }
+
+  function pollTicket(session, token) {
+    session.poll = setInterval(async () => {
+      let state;
+      try { state = await fetchJson(`/api/handoff/${token}`); } catch { return; }
+      if (state.status === 'ready' && state.article) {
+        stopPolling(session);
+        const saved = DEMO ? await api.adopt(state.article) : state.article;
+        session.mount.hidden = true;
+        session.mount.innerHTML = '';
+        session.onDone(saved);
+        return;
+      }
+      if (state.status === 'expired') return stopPolling(session);
+      const wait = session.mount.querySelector('.rescue-wait');
+      if (wait && state.error) wait.textContent = `that page did not parse: ${state.error}`;
+      else if (wait && state.status === 'claimed') wait.textContent = 'parsing received page…';
+    }, 2500);
+    polling.add(session);
+  }
+
+  function stopPolling(session) {
+    clearInterval(session.poll);
+    session.poll = null;
+    polling.delete(session);
+  }
+  function stopAllPolling() {
+    for (const session of [...polling]) stopPolling(session);
+  }
+
+  function offerRescue({ url, articleId, challenge, mount, onDone, head }) {
+    mount.hidden = false;
+    mount.innerHTML = `<p class="rescue-head">${esc(head || 'archive.today may hold a snapshot of this page.')}</p>
+      <p class="rescue-alt"><button class="rescue-submit" type="button">try archive.today</button></p>`;
+    mount.querySelector('.rescue-submit').addEventListener('click', () => {
+      startRescue({ url, articleId, challenge, mount, onDone });
+    });
+  }
+
+  function say(mount, message, kind) {
+    mount.hidden = false;
+    mount.innerHTML = `<p class="rescue-head${kind === 'error' ? ' error' : ''}">${esc(message)}</p>`;
+  }
 
   // ── helpers ──────────────────────────────────────────────────────────────
   function esc(s) {

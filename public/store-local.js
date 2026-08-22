@@ -43,9 +43,9 @@
         return article;
       },
 
-      async save(url) {
+      async save(url, source) {
         await ready;
-        const extracted = await fetchJson('/api/extract', { method: 'POST', body: { url } });
+        const extracted = await fetchJson('/api/extract', { method: 'POST', body: { url, ...sourceBody(source) } });
         const duplicate = library.find(article => article.url === extracted.url);
         if (duplicate) return { ...duplicate, duplicate: true };
 
@@ -67,6 +67,25 @@
         return evictedTitle ? { ...article, evicted_title: evictedTitle } : article;
       },
 
+      // An article the server already extracted (the captcha handoff delivered it
+      // to the server, not to this tab) still has to be filed in this library.
+      async adopt(extracted) {
+        await ready;
+        const existing = library.find(item => item.url === extracted.url);
+        const article = hydrate(extracted, {
+          id: existing ? existing.id : nextId++,
+          saved_at: existing?.saved_at || new Date().toISOString(),
+          favorite: Boolean(existing?.favorite),
+          archived: Boolean(existing?.archived),
+          progress: Number(existing?.progress) || 0,
+          read_at: existing?.read_at || null,
+        });
+        if (existing) library[library.indexOf(existing)] = article;
+        else library.unshift(article);
+        persist();
+        return article;
+      },
+
       async patch(id, body) {
         await ready;
         const article = find(id);
@@ -80,11 +99,14 @@
         return article;
       },
 
-      async refetch(id) {
+      async refetch(id, source) {
         await ready;
         const current = find(id);
         if (!current) throw new Error('not found');
-        const extracted = await fetchJson('/api/extract', { method: 'POST', body: { url: current.url } });
+        const extracted = await fetchJson('/api/extract', {
+          method: 'POST',
+          body: { url: current.url, ...sourceBody(source) },
+        });
         const updated = hydrate(extracted, {
           id: current.id,
           saved_at: current.saved_at,
@@ -133,6 +155,11 @@
       }
     }
   };
+
+  // Page source the browser fetched itself — the archive.today captcha rescue.
+  function sourceBody(source) {
+    return source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {};
+  }
 
   function readLibrary() {
     try {

@@ -144,6 +144,39 @@ input { font: inherit; color: inherit; }
 .demo-nudge code { display: block; margin-top: .35rem; overflow-wrap: anywhere; color: var(--ink); }
 .demo-nudge button { color: var(--accent); margin-top: .25rem; text-decoration: underline; }
 
+/* archive.today source handoff, shown in the library and in the reader */
+.rescue {
+  margin: .8rem 0 0; padding: .75rem .9rem; border: 1px solid var(--line);
+  background: var(--card); color: var(--ink-2); font-size: .82rem; line-height: 1.5;
+}
+.rescue-head { margin: 0; color: var(--ink); }
+.rescue-head.error, .rescue-error { margin: .35rem 0 0; color: var(--accent); }
+.rescue-steps { margin: .5rem 0 0; padding-left: 1.1rem; }
+.rescue-steps li { margin-top: .2rem; }
+.rescue-link { color: var(--ink); text-decoration: underline; }
+.rescue-link:hover { color: var(--accent); }
+.rescue-alt { margin: .55rem 0 0; }
+.rescue-hint, .rescue-note { color: var(--ink-3); }
+.rescue-note { margin: .6rem 0 0; font-size: .76rem; }
+.rescue-wait { margin: .5rem 0 0; font-style: italic; }
+.rescue-manual { margin-top: .6rem; display: flex; flex-direction: column; align-items: stretch; gap: .5rem; }
+.rescue-buttons { display: flex; align-items: center; gap: .8rem; }
+.rescue-manual textarea {
+  width: 100%; resize: vertical; font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .75rem; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); padding: .4rem .5rem;
+}
+.rescue-submit {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--ink-3); padding: .3rem .7rem;
+}
+.rescue-submit:hover { border-color: var(--ink); }
+.rescue-go {
+  font: inherit; color: var(--ink-2); background: none; border: 0; padding: 0;
+  cursor: pointer; text-decoration: underline;
+}
+.rescue-go:hover { color: var(--ink); }
+
 .lib-nav {
   display: flex;
   align-items: baseline;

@@ -76,9 +76,44 @@ npm start
   - Googlebot user-agent
   - AMP version
   - Wayback Machine
+  - archive.today (archive.is / .ph / .md and the other mirrors)
 - Keeps the longest available version if all sources are truncated.
 - Flags incomplete articles as **partial**.
 - Supports one-click re-extraction.
+
+### archive.today snapshots
+- Paste an `archive.is/…` link and particle reads that capture, filing it under
+  the original article's URL so it dedupes against the story itself.
+- Otherwise the mirrors are consulted automatically when every other route is
+  paywalled, using the memento timemap to find the newest capture.
+- The archive.today wrapper is stripped and images are pointed back at their
+  original hosts before the page reaches Readability.
+
+### When a snapshot cannot be fetched
+The mirrors rate-limit by IP, gate on a captcha cookie, and do not send CORS
+headers on a served snapshot. Every mirror is tried, but they share one backend,
+so a blocked address stays blocked. Particle then tries the fetch from your
+browser, and if that fails too, opens a panel:
+
+1. **open snapshot** in a new tab, wait for the article, solve a captcha if one
+   appears.
+2. **send page to particle**, a bookmarklet the panel generates. Drag it to the
+   bookmarks bar once, then one click per rescue.
+3. Or paste into the panel: page source (view source, select all, copy), or the
+   plain article text.
+
+The page source has to come out of that tab because the captcha is cleared
+against a cookie only that tab holds; a cross-origin fetch is uncredentialed and
+gets the captcha again. The bookmarklet posts back on a single-use ticket that
+expires in 15 minutes.
+
+The source is parsed server-side and saved like any other article. A capture
+reached by short code (`archive.is/kSJh2`) is filed under the story's own URL,
+and an article already saved as *partial* is rewritten in place.
+
+> The bookmarklet is desktop only, and browsers block it from an HTTPS page to a
+> plain-HTTP particle (Chrome and Firefox exempt `localhost`; Safari does not).
+> Paste is the fallback, and on mobile it is the only route.
 
 ### Reading Experience
 - Serif and sans-serif font options.
@@ -145,6 +180,9 @@ next to the compose file — see [`.env.example`](.env.example).
 | `PARTICLE_BASE` | unset | Mount below a path such as `/particle` |
 | `ALLOW_PRIVATE_HOSTS` | `0` | Set to `1` only when you intentionally save pages from a private network |
 | `IMAGE_MAX_BYTES` | `8388608` | Maximum image-proxy response size |
+| `SNAPSHOT_MAX_BYTES` | `8388608` | Maximum page source accepted from the browser during an archive.today rescue |
+| `ARCHIVE_TODAY_HOSTS` | mirror list | Comma-separated archive.today mirrors to try, in order |
+| `ARCHIVE_TODAY_COOKIE` | unset | Cookie header sent to archive.today, if you have a session that clears the captcha server-side |
 | `LLM_API_KEY` | unset | API key for the optional tagging/quality pass. Unset = feature off |
 | `LLM_API_URL` | OpenCode Zen | Any OpenAI-compatible `/chat/completions` URL — Ollama, OpenRouter, whatever you run |
 | `LLM_MODEL` | `deepseek-v4-flash` | Model name for the above |

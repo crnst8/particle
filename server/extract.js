@@ -2,6 +2,10 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 import createDOMPurify from 'dompurify';
 import { assertSafeUrl, safeFetch } from './net.js';
+import {
+  ArchiveChallengeError, fetchAnyMirror, findArchiveSnapshot,
+  parseArchiveUrl, stripArchiveChrome,
+} from './archive-today.js';
 
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const GOOGLEBOT_UA = 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/126.0.0.0 Safari/537.36';
@@ -91,6 +95,7 @@ function extractMeta(dom) {
     leadImage: get('meta[property="og:image"]') || get('meta[name="twitter:image"]'),
     canonical: get('link[rel="canonical"]', 'href'),
     ampUrl: get('link[rel="amphtml"]', 'href'),
+    ogUrl: get('meta[property="og:url"]') || get('meta[name="twitter:url"]'),
     publishedAt,
   };
 }
@@ -156,8 +161,9 @@ function looksPaywalled(text, wordCount) {
   return null;
 }
 
-function parseAttempt(html, url, method) {
+function parseAttempt(html, url, method, { preclean } = {}) {
   const dom = parseDom(html, url);
+  preclean?.(dom);
   const meta = extractMeta(dom);
   promotePullquotes(dom);
   const article = readabilityParse(dom);
@@ -199,14 +205,32 @@ async function waybackLookup(url) {
   return snap.url.replace(/(\/web\/\d+)\//, '$1id_/');
 }
 
-export async function extractArticle(inputUrl) {
+export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
   const url = normalizeUrl(inputUrl);
   await assertSafeUrl(url);
+
+  // A snapshot handed over by the browser (the captcha rescue path) skips the network.
+  if (html) return extractFromHtml(url, html, sourceUrl);
+
+  const pasted = parseArchiveUrl(inputUrl);
   const attempts = [];
-  let best = null; // best failed attempt, kept as fallback content
+  let best = null;      // best failed attempt, kept as fallback content
+  let challenge = null; // archive.today captcha a human could clear for us
   let ampUrl = null;
 
-  const strategies = [
+  const archiveAttempt = async (snapshotUrl) => {
+    const snapshot = await fetchAnyMirror(snapshotUrl, { userAgent: BROWSER_UA });
+    return { ...snapshot, preclean: stripArchiveChrome };
+  };
+
+  // A short-code snapshot (/kSJh2) names no origin site, so the mirrors are the
+  // only place to ask — hitting example.com's strategies would just be archive.is again.
+  const archiveOnly = Boolean(pasted && !pasted.originalUrl);
+  const strategies = archiveOnly ? [
+    { name: 'archive.today', run: () => archiveAttempt(pasted.snapshotUrl) },
+  ] : [
+    // A pasted archive.is link is an explicit request: honour it before anything else.
+    ...(pasted ? [{ name: 'archive.today', run: () => archiveAttempt(pasted.snapshotUrl) }] : []),
     { name: 'direct', run: () => fetchHtml(url) },
     { name: 'googlebot', run: () => fetchHtml(url, { ua: GOOGLEBOT_UA, referer: 'https://www.google.com/' }) },
     {
@@ -229,22 +253,33 @@ export async function extractArticle(inputUrl) {
         }
       },
     },
+    ...(pasted ? [] : [{
+      name: 'archive.today',
+      run: async () => {
+        const snapshotUrl = await findArchiveSnapshot(url);
+        if (!snapshotUrl) throw new FetchError('no archive.today snapshot');
+        return archiveAttempt(snapshotUrl);
+      },
+    }]),
   ];
 
   for (const strat of strategies) {
     try {
-      const { html, finalUrl } = await strat.run();
-      const attempt = parseAttempt(html, strat.name === 'wayback' ? url : finalUrl, strat.name);
+      const { html: body, finalUrl, preclean } = await strat.run();
+      const base = strat.name === 'wayback' ? url : finalUrl;
+      const attempt = parseAttempt(body, base, strat.name, { preclean });
       if (attempt.meta?.ampUrl && !ampUrl) {
         try { ampUrl = new URL(attempt.meta.ampUrl, finalUrl).href; } catch { /* bad amp href */ }
       }
       if (attempt.ok) {
         attempt.result.url = url;
+        if (archiveOnly) applyCapturedOrigin(attempt.result, attempt.meta, finalUrl);
         return attempt.result;
       }
       attempts.push(`${strat.name}: ${attempt.reason}`);
       if (attempt.result && (!best || attempt.result.word_count > best.word_count)) best = attempt.result;
     } catch (err) {
+      if (err instanceof ArchiveChallengeError) challenge = archiveChallenge(err, url);
       attempts.push(`${strat.name}: ${err.message}`);
     }
   }
@@ -254,17 +289,92 @@ export async function extractArticle(inputUrl) {
     best.url = url;
     best.quality = 'partial';
     best.quality_note = attempts.join('; ');
+    if (challenge) best.challenge = challenge;
     return best;
   }
   const err = new Error('Could not extract article. ' + attempts.join('; '));
   err.attempts = attempts;
+  if (challenge) {
+    err.challenge = challenge;
+    err.statusCode = 428; // Precondition Required — a human has to clear the captcha
+  }
   throw err;
+}
+
+/* A capture reached by short code is still an article on some other site. Move
+   it back under that URL so the library dedupes it and "view original" works. */
+function applyCapturedOrigin(result, meta, snapshotUrl) {
+  const original = parseArchiveUrl(snapshotUrl)?.originalUrl
+    || (meta?.ogUrl && !parseArchiveUrl(meta.ogUrl) ? absolute(meta.ogUrl) : null)
+    || (meta?.canonical && !parseArchiveUrl(meta.canonical) ? absolute(meta.canonical) : null);
+  if (!original) return result;
+  result.url = original;
+  result.canonical_url = original;
+  result.site_name = result.site_name && !/^archive\./.test(result.site_name)
+    ? result.site_name
+    : new URL(original).hostname.replace(/^www\./, '');
+  return result;
+}
+
+function absolute(value) {
+  try { return new URL(value).href; } catch { return null; }
+}
+
+function archiveChallenge(error, url) {
+  return {
+    provider: 'archive.today',
+    snapshot_url: error.challengeUrl,
+    original_url: url,
+    status: error.status || null,
+  };
+}
+
+/* Parse HTML the caller already holds — a snapshot the browser fetched, or page
+   source a reader pasted in after clearing a captcha by hand. */
+export function extractFromHtml(url, source, sourceUrl) {
+  const archive = sourceUrl ? parseArchiveUrl(sourceUrl) : null;
+  const base = sourceUrl || url;
+  const method = archive ? 'archive.today (browser)' : 'browser';
+  const html = looksLikeHtml(source) ? String(source) : plainTextToHtml(source);
+  const attempt = parseAttempt(html, base, method, { preclean: archive ? stripArchiveChrome : undefined });
+  if (!attempt.result) throw new Error(`Could not read that page source: ${attempt.reason}`);
+
+  const result = attempt.result;
+  result.url = url;
+  result.canonical_url = url;
+  // A capture reached by short code belongs to the site it captured, not to archive.today.
+  if (parseArchiveUrl(url)) applyCapturedOrigin(result, attempt.meta, sourceUrl || url);
+  if (!attempt.ok) {
+    result.quality = 'partial';
+    result.quality_note = `${method}: ${attempt.reason}`;
+  }
+  return result;
+}
+
+function looksLikeHtml(source) {
+  return /<\/?[a-z][\s\S]*>/i.test(String(source || '').slice(0, 4000));
+}
+
+/* Copying the rendered page (select all, copy) is the only route left on a
+   phone, where there is no view-source. Rebuild paragraphs from the text. */
+function plainTextToHtml(source) {
+  const lines = String(source || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (!lines.length) return '';
+  const [heading, ...body] = lines;
+  const escape = text => text.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  return `<html><head><title>${escape(heading)}</title></head><body><article>`
+    + `<h1>${escape(heading)}</h1>`
+    + body.map(line => `<p>${escape(line)}</p>`).join('')
+    + '</article></body></html>';
 }
 
 export function normalizeUrl(input) {
   let u = String(input || '').trim();
   if (!u) throw new Error('Empty URL');
   if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  // An archive.today link identifies the article it captured, so the library
+  // dedupes a pasted snapshot against the original story.
+  u = parseArchiveUrl(u)?.originalUrl || u;
   const url = new URL(u);
   if (!/^https?:$/.test(url.protocol)) throw new Error('Only http(s) URLs supported');
   // strip common tracking params
