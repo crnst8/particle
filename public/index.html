@@ -26,10 +26,18 @@ __PARTICLE_ANALYTICS__
   <!-- ── Library ──────────────────────────────────────────────── -->
   <main id="library" hidden>
     <header class="lib-head">
+      <div class="lib-top">
+        <button id="settings-btn" class="icon-btn" type="button" title="Settings"
+                aria-label="Settings" aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
+            <path fill="currentColor" d="M12 8.6a3.4 3.4 0 1 0 0 6.8 3.4 3.4 0 0 0 0-6.8Zm0 5.4a2 2 0 1 1 0-4 2 2 0 0 1 0 4Z"/>
+            <path fill="currentColor" d="M20.3 13.6a8.6 8.6 0 0 0 0-3.2l1.7-1.3a.7.7 0 0 0 .2-.9l-1.7-2.9a.7.7 0 0 0-.85-.3l-2 .8a8.4 8.4 0 0 0-2.75-1.6l-.3-2.1a.7.7 0 0 0-.7-.6h-3.4a.7.7 0 0 0-.7.6l-.3 2.1a8.4 8.4 0 0 0-2.75 1.6l-2-.8a.7.7 0 0 0-.85.3L1.8 8.2a.7.7 0 0 0 .2.9l1.7 1.3a8.6 8.6 0 0 0 0 3.2L2 14.9a.7.7 0 0 0-.2.9l1.7 2.9a.7.7 0 0 0 .85.3l2-.8a8.4 8.4 0 0 0 2.75 1.6l.3 2.1a.7.7 0 0 0 .7.6h3.4a.7.7 0 0 0 .7-.6l.3-2.1a8.4 8.4 0 0 0 2.75-1.6l2 .8a.7.7 0 0 0 .85-.3l1.7-2.9a.7.7 0 0 0-.2-.9ZM18.6 12c0 .5-.05 1-.13 1.48l-.13.8 1.6 1.24-.83 1.44-1.87-.75-.63.52c-.72.6-1.55 1.08-2.45 1.4l-.76.27-.28 1.98h-1.66l-.28-1.98-.76-.27a6.9 6.9 0 0 1-2.45-1.4l-.63-.52-1.87.75-.83-1.44 1.6-1.24-.13-.8a7.2 7.2 0 0 1 0-2.96l.13-.8-1.6-1.24.83-1.44 1.87.75.63-.52c.72-.6 1.55-1.08 2.45-1.4l.76-.27.28-1.98h1.66l.28 1.98.76.27c.9.32 1.73.8 2.45 1.4l.63.52 1.87-.75.83 1.44-1.6 1.24.13.8c.08.49.13.98.13 1.48Z"/>
+          </svg>
+        </button>
+      </div>
       <h1 class="brand">
         <span class="sr-only">particle</span>
-        <img class="brand-logo brand-logo-light" src="__PARTICLE_BASE__/logo.png" width="440" height="90" alt="">
-        <img class="brand-logo brand-logo-dark" src="__PARTICLE_BASE__/logo-dark.png" width="440" height="90" alt="">
+        <span class="brand-dot" aria-hidden="true"></span>
       </h1>
       <form id="save-form" autocomplete="off">
         <input id="url-input" type="url" inputmode="url" placeholder="paste a url, press enter"
@@ -55,7 +63,7 @@ __PARTICLE_ANALYTICS__
     </header>
     <ul id="list" class="article-list"></ul>
     <div id="empty" class="empty" hidden>
-      <p class="empty-big">nothing here yet</p>
+      <p class="empty-big" id="empty-big">nothing here yet</p>
       <p class="empty-sub" id="empty-copy">paste a url above to save your first article</p>
     </div>
     <footer class="library-tools">
@@ -77,6 +85,7 @@ __PARTICLE_ANALYTICS__
         <button id="listen-btn" class="bar-btn" title="Listen (l)" hidden>&#9834;</button>
         <button id="fav-btn" class="bar-btn" title="Favorite (f)">&#9734;</button>
         <button id="archive-btn" class="bar-btn" title="Archive (e)">&#8615;</button>
+        <button id="more-btn" class="bar-btn" title="More" aria-haspopup="menu" aria-expanded="false">&#8943;</button>
       </div>
     </header>
     <div class="reader-scroll" id="reader-scroll">
@@ -104,6 +113,21 @@ __PARTICLE_ANALYTICS__
       </div>
     </div>
 
+    <!-- ── Trim (hand-edit the saved copy) ──────────────────────── -->
+    <div id="trim-bar" class="trim-bar" hidden>
+      <p class="trim-hint">
+        <strong>trimming.</strong>
+        <span class="trim-hint-desk">click a paragraph, or select text, to mark it for removal.</span>
+        <span class="trim-hint-touch">tap a paragraph, or select text, to mark it for removal.</span>
+      </p>
+      <div class="trim-row">
+        <button id="trim-selection" class="trim-btn" type="button">mark selection</button>
+        <span id="trim-count" class="trim-count">nothing marked</span>
+        <button id="trim-cancel" class="trim-btn" type="button">cancel</button>
+        <button id="trim-apply" class="trim-btn trim-go" type="button" disabled>remove &amp; save</button>
+      </div>
+    </div>
+
     <!-- ── Narration player ─────────────────────────────────────── -->
     <div id="player" class="player" hidden>
       <div class="player-row">
@@ -125,6 +149,95 @@ __PARTICLE_ANALYTICS__
       <div id="pl-panel" class="pl-panel" hidden></div>
     </div>
   </article>
+
+  <!-- ── Popover menu (row actions / reader overflow) ──────────── -->
+  <div id="menu" class="menu" hidden role="menu" aria-label="Article actions"></div>
+
+  <!-- ── Settings ─────────────────────────────────────────────── -->
+  <div id="settings" class="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="sheet-scrim" data-close></div>
+    <div class="sheet-panel" role="document">
+      <header class="sheet-head">
+        <h2 id="settings-title">settings</h2>
+        <button class="sheet-x" type="button" data-close aria-label="Close settings">&times;</button>
+      </header>
+      <div class="sheet-body">
+
+        <section class="set-group">
+          <h3>appearance</h3>
+          <div class="set-row">
+            <label id="set-theme-label">theme</label>
+            <div class="seg" id="set-theme" role="radiogroup" aria-labelledby="set-theme-label">
+              <button type="button" data-value="system" role="radio">device</button>
+              <button type="button" data-value="light" role="radio">light</button>
+              <button type="button" data-value="sepia" role="radio">sepia</button>
+              <button type="button" data-value="dark" role="radio">dark</button>
+            </div>
+          </div>
+          <div class="set-row">
+            <label id="set-accent-label">accent</label>
+            <div class="swatches" id="set-accent" role="radiogroup" aria-labelledby="set-accent-label"></div>
+          </div>
+        </section>
+
+        <section class="set-group">
+          <h3>reading</h3>
+          <div class="set-row">
+            <label id="set-face-label">typeface</label>
+            <div class="seg" id="set-face" role="radiogroup" aria-labelledby="set-face-label">
+              <button type="button" data-value="serif" role="radio">serif</button>
+              <button type="button" data-value="sans" role="radio">sans</button>
+            </div>
+          </div>
+          <div class="set-row">
+            <label for="set-size">text size</label>
+            <input id="set-size" type="range" min="0.85" max="1.6" step="0.0625" class="set-range">
+          </div>
+          <p class="set-sample" id="set-sample">The quick brown fox jumps over the lazy dog.</p>
+        </section>
+
+        <section class="set-group">
+          <h3>library</h3>
+          <div class="set-row">
+            <label id="set-reads-label">read articles</label>
+            <div class="seg" id="set-reads" role="radiogroup" aria-labelledby="set-reads-label">
+              <button type="button" data-value="1" role="radio">show in all</button>
+              <button type="button" data-value="0" role="radio">only in read</button>
+            </div>
+          </div>
+          <p class="set-note">“only in read” keeps finished articles out of the main tab and gives
+            them a <em>read</em> tab of their own.</p>
+        </section>
+
+        <section class="set-group">
+          <h3>lists</h3>
+          <p class="set-note">Lists you make show up as tabs in the library. Add an article to one
+            from its <span class="set-kbd">&#8943;</span> menu.</p>
+          <ul class="set-lists" id="set-lists"></ul>
+          <form class="set-newlist" id="set-newlist">
+            <input id="set-listname" type="text" maxlength="40" placeholder="new list name" aria-label="New list name">
+            <button type="submit">add</button>
+          </form>
+          <p class="set-error" id="set-list-error" hidden></p>
+        </section>
+
+        <section class="set-group set-danger">
+          <h3>reset</h3>
+          <p class="set-note">Deletes every saved article, and their narrations, for good. There is
+            no undo and no export.</p>
+          <label class="set-check"><input type="checkbox" id="set-reset-lists"> delete my lists too</label>
+          <div class="set-reset-row">
+            <input id="set-reset-confirm" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="type DELETE to confirm" aria-label="Type DELETE to confirm">
+            <button id="set-reset" class="set-danger-btn" type="button" disabled>delete everything</button>
+          </div>
+          <p class="set-error" id="set-reset-status" hidden></p>
+        </section>
+
+        <p class="set-version" id="set-version"></p>
+      </div>
+    </div>
+  </div>
 </div>
 <script src="__PARTICLE_BASE__/store-local.js"></script>
 <script src="__PARTICLE_BASE__/app.js"></script>

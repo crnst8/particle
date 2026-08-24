@@ -1,10 +1,13 @@
 /* particle demo store — the server extracts; this browser owns the library */
 (() => {
   const STORAGE_KEY = 'particle.demo.library.v1';
+  const LISTS_KEY = 'particle.demo.collections.v1';
 
   window.createParticleLocalStore = function createParticleLocalStore({ fetchJson, maxArticles = 15 }) {
     let library = readLibrary();
+    let collections = readCollections();
     let nextId = library.reduce((max, article) => Math.max(max, Number(article.id) || 0), 0) + 1;
+    let nextListId = collections.reduce((max, list) => Math.max(max, Number(list.id) || 0), 0) + 1;
     const firstVisit = localStorage.getItem(STORAGE_KEY) === null;
 
     const ready = (async () => {
@@ -26,11 +29,14 @@
       async list(q, filter) {
         await ready;
         const query = String(q || '').trim().toLowerCase();
+        const inList = /^collection:(\d+)$/.exec(String(filter || ''));
         return library
-          .filter(article => filter === 'unread' ? !article.read_at && !article.archived
-            : filter === 'favorites' ? article.favorite
-              : filter === 'archived' ? article.archived
-                : !article.archived)
+          .filter(article => inList ? !article.archived && article.collections.includes(Number(inList[1]))
+            : filter === 'unread' ? !article.read_at && !article.archived
+              : filter === 'read' ? Boolean(article.read_at) && !article.archived
+                : filter === 'favorites' ? article.favorite
+                  : filter === 'archived' ? article.archived
+                    : !article.archived)
           .filter(article => !query || [article.title, article.site_name, article.byline, article.text_content]
             .some(value => String(value || '').toLowerCase().includes(query)))
           .sort((a, b) => String(b.saved_at).localeCompare(String(a.saved_at)));
@@ -79,6 +85,7 @@
           archived: Boolean(existing?.archived),
           progress: Number(existing?.progress) || 0,
           read_at: existing?.read_at || null,
+          collections: existing?.collections || [],
         });
         if (existing) library[library.indexOf(existing)] = article;
         else library.unshift(article);
@@ -95,6 +102,17 @@
         if ('progress' in body) article.progress = Math.max(0, Math.min(1, Number(body.progress) || 0));
         if ('read' in body) article.read_at = body.read ? new Date().toISOString() : null;
         if (Array.isArray(body.tags)) article.tags = body.tags;
+        // A hand-trimmed body. The markup came out of the article this browser
+        // already holds, so the text and word count are recomputed from it.
+        if (typeof body.content_html === 'string') {
+          const text = htmlToText(body.content_html);
+          if (!text) throw new Error('that edit would leave the article empty');
+          article.content_html = body.content_html;
+          article.text_content = text;
+          article.word_count = text.split(/\s+/).length;
+          article.excerpt = text.slice(0, 300);
+          article.edited_at = new Date().toISOString();
+        }
         persist();
         return article;
       },
@@ -115,6 +133,8 @@
           archived: current.archived,
           progress: current.progress,
           tags: current.tags,
+          collections: current.collections,
+          edited_at: null,
         });
         library[library.indexOf(current)] = updated;
         persist();
@@ -127,7 +147,89 @@
         persist();
         return { ok: true };
       },
+
+      async removeAll({ includeLists = false } = {}) {
+        await ready;
+        const deleted = library.length;
+        library = [];
+        if (includeLists) { collections = []; persistLists(); }
+        persist();
+        return { deleted };
+      },
+
+      // ── collections ──────────────────────────────────────────────────────
+      async listCollections() {
+        await ready;
+        return collections
+          .map(list => ({
+            ...list,
+            count: library.filter(a => !a.archived && a.collections.includes(list.id)).length,
+          }))
+          .sort((a, b) => a.position - b.position || a.id - b.id);
+      },
+
+      async createCollection(name) {
+        await ready;
+        const clean = String(name || '').trim().slice(0, 40);
+        if (!clean) throw new Error('a list needs a name');
+        if (collections.some(list => list.name.toLowerCase() === clean.toLowerCase())) {
+          throw new Error('you already have a list with that name');
+        }
+        const list = { id: nextListId++, name: clean, position: collections.length + 1 };
+        collections.push(list);
+        persistLists();
+        return list;
+      },
+
+      async renameCollection(id, name) {
+        await ready;
+        const clean = String(name || '').trim().slice(0, 40);
+        if (!clean) throw new Error('a list needs a name');
+        const list = collections.find(item => item.id === Number(id));
+        if (!list) throw new Error('no such list');
+        if (collections.some(item => item.id !== list.id && item.name.toLowerCase() === clean.toLowerCase())) {
+          throw new Error('you already have a list with that name');
+        }
+        list.name = clean;
+        persistLists();
+        return list;
+      },
+
+      async deleteCollection(id) {
+        await ready;
+        collections = collections.filter(list => list.id !== Number(id));
+        for (const article of library) {
+          article.collections = article.collections.filter(listId => listId !== Number(id));
+        }
+        persistLists();
+        persist();
+        return { ok: true };
+      },
+
+      async setArticleCollection(articleId, collectionId, member) {
+        await ready;
+        const article = find(articleId);
+        if (!article) throw new Error('not found');
+        const listId = Number(collectionId);
+        article.collections = article.collections.filter(id => id !== listId);
+        if (member) article.collections.push(listId);
+        persist();
+        return article;
+      },
     };
+
+    function persistLists() {
+      try { localStorage.setItem(LISTS_KEY, JSON.stringify(collections)); } catch { /* full: lists are small */ }
+    }
+
+    function readCollections() {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(LISTS_KEY) || '[]');
+        return Array.isArray(parsed) ? parsed.filter(list => list && list.id && list.name) : [];
+      } catch {
+        return [];
+      }
+    }
 
     function find(id) {
       return library.find(article => Number(article.id) === Number(id));
@@ -161,6 +263,18 @@
     return source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {};
   }
 
+  // A block boundary is a word boundary; textContent alone would run the last
+  // word of one paragraph into the first of the next.
+  const TEXT_BREAKS = 'p, h1, h2, h3, h4, h5, h6, blockquote, figure, figcaption, li, pre, hr, br,'
+    + ' tr, td, th, caption, div, section, dt, dd';
+
+  function htmlToText(html) {
+    const holder = document.createElement('div');
+    holder.innerHTML = String(html || '');
+    for (const node of holder.querySelectorAll(TEXT_BREAKS)) node.after(document.createTextNode(' '));
+    return (holder.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
   function readLibrary() {
     try {
       const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
@@ -180,6 +294,8 @@
       archived: Boolean(article.archived),
       progress: Number(article.progress) || 0,
       tags: Array.isArray(article.tags) ? article.tags : [],
+      collections: Array.isArray(article.collections) ? article.collections.map(Number) : [],
+      edited_at: article.edited_at || null,
       ...overrides,
     };
   }

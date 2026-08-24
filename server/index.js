@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, extname, join } from 'node:path';
 import { createAuth } from './auth.js';
 import { createDemoSeed, rateLimit } from './demo.js';
-import { extractArticle, normalizeUrl, BROWSER_UA } from './extract.js';
+import { extractArticle, normalizeUrl, sanitizeArticleHtml, textFromHtml, BROWSER_UA } from './extract.js';
 import { findArchiveSnapshot, parseArchiveUrl } from './archive-today.js';
 import { claimTicket, createTicket, readTicket, settleTicket } from './handoff.js';
 import { isLlmConfigured, assessArticle } from './llm.js';
@@ -77,7 +77,8 @@ if (DEMO_MODE) {
     }
   });
   app.get(api('/demo-seed'), async (_req, res) => res.json(await getDemoSeed()));
-  app.use(api('/articles'), (_req, res) => res.status(404).json({ error: 'the demo library lives in your browser' }));
+  app.use([api('/articles'), api('/collections')],
+    (_req, res) => res.status(404).json({ error: 'the demo library lives in your browser' }));
 } else {
   registerLibraryRoutes(app);
 }
@@ -302,12 +303,64 @@ function registerLibraryRoutes(router) {
     if ('read' in body) fields.read_at = body.read ? new Date().toISOString() : null;
     if ('tags' in body && Array.isArray(body.tags)) fields.tags = body.tags;
     if ('audio_pos' in body) fields.audio_pos = Math.max(0, Number(body.audio_pos) || 0);
+    // A hand-trimmed body: re-sanitised here, and its text and word count
+    // recomputed so search and the reading estimate follow the edit.
+    if (typeof body.content_html === 'string') {
+      const clean = sanitizeArticleHtml(body.content_html);
+      const { text, wordCount } = textFromHtml(clean);
+      if (!text) return res.status(400).json({ error: 'that edit would leave the article empty' });
+      fields.content_html = clean;
+      fields.text_content = text;
+      fields.word_count = wordCount;
+      fields.excerpt = text.slice(0, 300);
+      fields.edited_at = new Date().toISOString();
+    }
     res.json(store.updateArticle(id, fields));
   });
 
   router.delete(api('/articles/:id'), (req, res) => {
     store.deleteArticle(Number(req.params.id));
     res.json({ ok: true });
+  });
+
+  // Settings → reset. Destructive and unrecoverable, so it is its own route
+  // rather than a flag on anything else.
+  router.delete(api('/articles'), (req, res) => {
+    res.json(store.deleteAllArticles({ includeCollections: req.query.lists === '1' }));
+  });
+
+  // ── collections ───────────────────────────────────────────────────────────
+  router.get(api('/collections'), (_req, res) => res.json(store.listCollections()));
+
+  router.post(api('/collections'), (req, res) => {
+    try {
+      res.status(201).json(store.createCollection(req.body?.name));
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  });
+
+  router.patch(api('/collections/:id'), (req, res) => {
+    const id = Number(req.params.id);
+    if (!store.getCollection(id)) return res.status(404).json({ error: 'not found' });
+    try {
+      res.json(store.renameCollection(id, req.body?.name));
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  });
+
+  router.delete(api('/collections/:id'), (req, res) => {
+    store.deleteCollection(Number(req.params.id));
+    res.json({ ok: true });
+  });
+
+  router.put(api('/articles/:id/collections/:collectionId'), (req, res) => {
+    const id = Number(req.params.id);
+    const collectionId = Number(req.params.collectionId);
+    if (!store.getArticle(id)) return res.status(404).json({ error: 'not found' });
+    if (!store.getCollection(collectionId)) return res.status(404).json({ error: 'no such list' });
+    res.json(store.setArticleCollection(id, collectionId, req.body?.member !== false));
   });
 
   if (narrator) registerNarrationRoutes(router);

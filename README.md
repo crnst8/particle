@@ -1,30 +1,32 @@
-
+<div align="center">
 
 
 # particle
 
 ### A self-hosted tool to read & save articles without all the interruptions
 
-### inspired by the same vitriol behind <a href='https://lxe.github.io/everywebsite/'> this gem. </a>
+
+
+
+
+
+
+
+<img src='./devices.png' width=820px> 
+
+<br />
+
+  ## [Try the demo](https://particle.crnst8.com/try)
 
  #### Paste a URL → particle pulls the article out of the page (text, images, pullquotes, structure) → files it in a searchable library you own for clean reading without autoplay videos, subscription CTAs, ads or cookie notifications.
 
- ---
-
-
-<img src='./sc1.png' width=520px>  <img src='./sc2.png' width=520px>
 
 
 
 
+</div>
 
-### [**Try the demo**](https://particle.crnst8.com/try)
 
- **Note**: the demo library lives in your browser. Saving, favourites and reading
- progress use localStorage; nothing is stored on the server. The self-hosted
- version saves pasted links into SQLite for later recall.
-
----
 
 
 ## Quick start
@@ -118,7 +120,8 @@ and an article already saved as *partial* is rewritten in place.
 ### Reading Experience
 - Serif and sans-serif font options.
 - Adjustable text size.
-- Light, sepia and dark themes.
+- Light, sepia and dark themes, or follow the device.
+- A choice of accent colour.
 - Optional drop caps.
 - Preserves pullquotes.
 - Displays estimated reading time.
@@ -130,6 +133,32 @@ and an article already saved as *partial* is rewritten in place.
 - SQLite FTS5 search with Porter stemming.
 - Favourite articles.
 - Archive articles.
+- Delete articles, from the library row or from the reader.
+- Lists you make yourself. Each one becomes a tab in the library; an article can
+  be in any number of them, added from its `⋯` menu.
+- Read articles either stay in the main tab or move to a **read** tab of their own.
+
+### Settings
+Reached from the gear on the library screen.
+- **Appearance** — theme (device / light / sepia / dark) and accent colour.
+- **Reading** — typeface and default text size, with a live sample.
+- **Library** — where read articles show up.
+- **Lists** — create, rename and delete lists. Deleting a list leaves its articles alone.
+- **Reset** — delete every saved article, and optionally every list. Typed
+  confirmation, no undo, no export.
+
+### Trimming a saved article
+An article you saved is yours to edit. **⋯ → trim sections…** in the reader turns
+on trim mode:
+- Click or tap a paragraph, heading, pullquote, figure or list to mark it.
+- Or select a run of text and press **mark selection** (or backspace) to mark
+  exactly that.
+- Marked passages are struck through and tinted; nothing is written until
+  **remove & save**, which asks first.
+- **Cancel** restores the article exactly. Re-extracting is the way back to the
+  original after a save.
+- Trimmed articles are marked as such in the library, and their reading time,
+  excerpt and search text follow the edit.
 
 ### Image Handling
 - Proxies article images so hotlink-protected images continue to load.
@@ -190,7 +219,9 @@ and an article already saved as *partial* is rewritten in place.
   `/` search 
 
 
-`esc` back.
+`esc` back — and closes settings, a menu, or trim mode.
+
+In trim mode, `backspace` marks the current selection.
 
 ---
 

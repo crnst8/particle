@@ -8,3 +8,4 @@ data/
 public/fonts/
 .publish.env
 publish.sh
+_working/

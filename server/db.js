@@ -13,7 +13,7 @@ db.exec(`
 `);
 
 const { user_version: version } = db.prepare('PRAGMA user_version').get();
-if (version > 2) throw new Error(`Database schema ${version} is newer than this particle build supports`);
+if (version > 3) throw new Error(`Database schema ${version} is newer than this particle build supports`);
 
 if (version < 1) db.exec(`
   BEGIN IMMEDIATE;
@@ -105,13 +105,49 @@ if (version < 2) db.exec(`
   COMMIT;
 `);
 
-const LIST_COLS = `id, url, canonical_url, title, byline, site_name, excerpt, word_count,
-  lead_image, published_at, saved_at, read_at, favorite, archived, tags, quality, fetch_method, progress`;
+// v3 — collections (reader-made lists) and a mark for a hand-edited body.
+if (version < 3) db.exec(`
+  BEGIN IMMEDIATE;
 
+  ALTER TABLE articles ADD COLUMN edited_at TEXT;
+
+  CREATE TABLE IF NOT EXISTS collections (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    position   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_name ON collections(name COLLATE NOCASE);
+
+  CREATE TABLE IF NOT EXISTS article_collections (
+    article_id    INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    added_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (article_id, collection_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_article_collections_c ON article_collections(collection_id);
+
+  PRAGMA user_version = 3;
+  COMMIT;
+`);
+
+const LIST_COLS = `id, url, canonical_url, title, byline, site_name, excerpt, word_count,
+  lead_image, published_at, saved_at, read_at, favorite, archived, tags, quality, fetch_method,
+  progress, edited_at`;
+
+/* A filter is one of the built-in views, or `collection:<id>` for a list the
+   reader made. `all` and `unread` both exclude the archive; hiding read articles
+   from the main tab is the client asking for `unread` instead of `all`. */
 export function listArticles({ q, filter } = {}) {
   const where = [];
   const params = [];
-  if (filter === 'unread') where.push('read_at IS NULL AND archived = 0');
+  const collection = /^collection:(\d+)$/.exec(String(filter || ''));
+  if (collection) {
+    where.push('archived = 0');
+    where.push('id IN (SELECT article_id FROM article_collections WHERE collection_id = ?)');
+    params.push(Number(collection[1]));
+  } else if (filter === 'unread') where.push('read_at IS NULL AND archived = 0');
+  else if (filter === 'read') where.push('read_at IS NOT NULL AND archived = 0');
   else if (filter === 'favorites') where.push('favorite = 1');
   else if (filter === 'archived') where.push('archived = 1');
   else where.push('archived = 0');
@@ -123,17 +159,17 @@ export function listArticles({ q, filter } = {}) {
     params.push(terms);
   }
   const sql = `SELECT ${LIST_COLS} FROM articles WHERE ${where.join(' AND ')} ORDER BY saved_at DESC LIMIT 500`;
-  return db.prepare(sql).all(...params).map(hydrate);
+  return withCollections(db.prepare(sql).all(...params).map(hydrate));
 }
 
 export function getArticle(id) {
   const row = db.prepare('SELECT * FROM articles WHERE id = ?').get(id);
-  return row ? hydrate(row) : null;
+  return row ? withCollections([hydrate(row)])[0] : null;
 }
 
 export function getByUrl(url) {
   const row = db.prepare(`SELECT ${LIST_COLS} FROM articles WHERE url = ?`).get(url);
-  return row ? hydrate(row) : null;
+  return row ? withCollections([hydrate(row)])[0] : null;
 }
 
 export function insertArticle(a) {
@@ -151,7 +187,8 @@ export function insertArticle(a) {
 export function replaceArticleContent(id, a) {
   db.prepare(`
     UPDATE articles SET canonical_url=?, title=?, byline=?, site_name=?, excerpt=?, content_html=?,
-      text_content=?, word_count=?, lead_image=?, published_at=?, quality=?, quality_note=NULL, fetch_method=?
+      text_content=?, word_count=?, lead_image=?, published_at=?, quality=?, quality_note=NULL,
+      fetch_method=?, edited_at=NULL
     WHERE id=?
   `).run(a.canonical_url, a.title, a.byline, a.site_name, a.excerpt, a.content_html,
     a.text_content, a.word_count, a.lead_image, a.published_at, a.quality ?? null, a.fetch_method, id);
@@ -159,7 +196,8 @@ export function replaceArticleContent(id, a) {
 }
 
 export function updateArticle(id, fields) {
-  const allowed = ['favorite', 'archived', 'progress', 'read_at', 'tags', 'quality', 'quality_note', 'title', 'audio_pos'];
+  const allowed = ['favorite', 'archived', 'progress', 'read_at', 'tags', 'quality', 'quality_note',
+    'title', 'audio_pos', 'content_html', 'text_content', 'word_count', 'excerpt', 'edited_at'];
   const sets = [];
   const params = [];
   for (const k of allowed) {
@@ -178,12 +216,91 @@ export function deleteArticle(id) {
   db.prepare('DELETE FROM articles WHERE id = ?').run(id);
 }
 
+/* The settings reset. Narrations and list membership cascade off the articles;
+   the collections themselves are the reader's own structure, so they survive
+   unless the caller asks for them too. */
+export function deleteAllArticles({ includeCollections = false } = {}) {
+  const { n } = db.prepare('SELECT COUNT(*) AS n FROM articles').get();
+  db.exec('DELETE FROM articles');
+  if (includeCollections) db.exec('DELETE FROM collections');
+  return { deleted: n };
+}
+
+// ── collections ──────────────────────────────────────────────────────────────
+// Lists the reader makes by hand. They sit beside the built-in tabs rather than
+// replacing them, and an article can be in any number of them.
+
+export function listCollections() {
+  return db.prepare(`
+    SELECT c.id, c.name, c.position,
+           (SELECT COUNT(*) FROM article_collections ac
+              JOIN articles a ON a.id = ac.article_id
+             WHERE ac.collection_id = c.id AND a.archived = 0) AS count
+    FROM collections c ORDER BY c.position ASC, c.id ASC
+  `).all();
+}
+
+export function getCollection(id) {
+  return db.prepare('SELECT id, name, position FROM collections WHERE id = ?').get(id) || null;
+}
+
+export function createCollection(name) {
+  const clean = String(name || '').trim().slice(0, 40);
+  if (!clean) throw new Error('a list needs a name');
+  const existing = db.prepare('SELECT id FROM collections WHERE name = ? COLLATE NOCASE').get(clean);
+  if (existing) throw new Error('you already have a list with that name');
+  const { next } = db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS next FROM collections').get();
+  const r = db.prepare('INSERT INTO collections (name, position) VALUES (?, ?)').run(clean, next);
+  return getCollection(Number(r.lastInsertRowid));
+}
+
+export function renameCollection(id, name) {
+  const clean = String(name || '').trim().slice(0, 40);
+  if (!clean) throw new Error('a list needs a name');
+  const clash = db.prepare('SELECT id FROM collections WHERE name = ? COLLATE NOCASE AND id != ?').get(clean, id);
+  if (clash) throw new Error('you already have a list with that name');
+  db.prepare('UPDATE collections SET name = ? WHERE id = ?').run(clean, id);
+  return getCollection(id);
+}
+
+export function deleteCollection(id) {
+  db.prepare('DELETE FROM collections WHERE id = ?').run(id);
+}
+
+export function setArticleCollection(articleId, collectionId, member) {
+  if (member) {
+    db.prepare('INSERT OR IGNORE INTO article_collections (article_id, collection_id) VALUES (?, ?)')
+      .run(articleId, collectionId);
+  } else {
+    db.prepare('DELETE FROM article_collections WHERE article_id = ? AND collection_id = ?')
+      .run(articleId, collectionId);
+  }
+  return getArticle(articleId);
+}
+
+/** Attach each article's list membership in one query rather than one per row. */
+function withCollections(rows) {
+  if (!rows.length) return rows;
+  const holes = rows.map(() => '?').join(',');
+  const links = db.prepare(
+    `SELECT article_id, collection_id FROM article_collections WHERE article_id IN (${holes})`
+  ).all(...rows.map(r => r.id));
+  const byArticle = new Map();
+  for (const link of links) {
+    if (!byArticle.has(link.article_id)) byArticle.set(link.article_id, []);
+    byArticle.get(link.article_id).push(link.collection_id);
+  }
+  for (const row of rows) row.collections = byArticle.get(row.id) || [];
+  return rows;
+}
+
 function hydrate(row) {
   return {
     ...row,
     tags: safeJson(row.tags, []),
     favorite: !!row.favorite,
     archived: !!row.archived,
+    collections: [],
   };
 }
 

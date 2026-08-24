@@ -386,3 +386,24 @@ export function normalizeUrl(input) {
 }
 
 export { BROWSER_UA };
+
+/* An article body the reader edited by hand comes back through the same filter
+   the extractor uses, so a trimmed article is no more trusted than a fetched one.
+   Images already point at our proxy and are left alone. */
+export function sanitizeArticleHtml(html) {
+  return sanitize(String(html || ''));
+}
+
+/** Plain text and a word count for an edited body — what search and the reading
+    estimate are built from. A block boundary is a word boundary, which is the
+    one thing textContent on its own gets wrong. */
+export function textFromHtml(html) {
+  const dom = new JSDOM(`<body>${String(html || '')}</body>`);
+  const doc = dom.window.document;
+  for (const node of doc.body.querySelectorAll(TEXT_BREAKS)) node.after(doc.createTextNode(' '));
+  const text = (doc.body.textContent || '').replace(/\s+/g, ' ').trim();
+  return { text, wordCount: text ? text.split(/\s+/).length : 0 };
+}
+
+const TEXT_BREAKS = 'p, h1, h2, h3, h4, h5, h6, blockquote, figure, figcaption, li, pre, hr, br,'
+  + ' tr, td, th, caption, div, section, dt, dd';

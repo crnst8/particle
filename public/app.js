@@ -14,26 +14,78 @@
     filter: localStorage.getItem('p.filter') || 'all',
     q: '',
     articles: [],
+    collections: [],     // lists the reader made, shown as extra tabs
     current: null,       // article open in reader
     progressTimer: null,
     narration: false,    // server has a text-to-speech key configured
   };
 
   // ── prefs ────────────────────────────────────────────────────────────────
+  // Everything here is a display choice, so it lives in this browser rather
+  // than the library — a phone and a laptop can read the same library
+  // differently. Lists and article edits are library state and go to the server.
+  const THEMES = ['system', 'light', 'sepia', 'dark'];
+  const ACCENTS = [
+    { id: 'ember', value: '', swatch: '#d64b2f', label: 'ember (default)' },
+    { id: 'crimson', value: '#a8323f', swatch: '#a8323f', label: 'crimson' },
+    { id: 'ochre', value: '#b07d2b', swatch: '#b07d2b', label: 'ochre' },
+    { id: 'moss', value: '#3f7a5e', swatch: '#3f7a5e', label: 'moss' },
+    { id: 'slate', value: '#3a5c99', swatch: '#3a5c99', label: 'slate' },
+    { id: 'plum', value: '#7b4f96', swatch: '#7b4f96', label: 'plum' },
+  ];
+  const SIZE_MIN = 0.85, SIZE_MAX = 1.6, SIZE_STEP = 0.0625;
+
   const prefs = {
-    get theme() { return localStorage.getItem('p.theme') || 'light'; },
-    set theme(v) { localStorage.setItem('p.theme', v); applyPrefs(); },
-    get size() { return parseFloat(localStorage.getItem('p.size') || '1.125'); },
-    set size(v) { localStorage.setItem('p.size', v); applyPrefs(); },
-    get face() { return localStorage.getItem('p.face') || 'serif'; },
-    set face(v) { localStorage.setItem('p.face', v); applyPrefs(); },
+    get theme() {
+      const saved = localStorage.getItem('p.theme');
+      return THEMES.includes(saved) ? saved : 'light';
+    },
+    set theme(v) { localStorage.setItem('p.theme', THEMES.includes(v) ? v : 'light'); applyPrefs(); },
+    get size() { return clampSize(parseFloat(localStorage.getItem('p.size') || '1.125')); },
+    set size(v) { localStorage.setItem('p.size', clampSize(v)); applyPrefs(); },
+    get face() { return localStorage.getItem('p.face') === 'sans' ? 'sans' : 'serif'; },
+    set face(v) { localStorage.setItem('p.face', v === 'sans' ? 'sans' : 'serif'); applyPrefs(); },
+    get accent() {
+      const saved = localStorage.getItem('p.accent') || 'ember';
+      return ACCENTS.some(a => a.id === saved) ? saved : 'ember';
+    },
+    set accent(v) { localStorage.setItem('p.accent', v); applyPrefs(); },
+    // read articles in the main tab, or only under their own tab
+    get readsInAll() { return localStorage.getItem('p.readsInAll') !== '0'; },
+    set readsInAll(v) { localStorage.setItem('p.readsInAll', v ? '1' : '0'); },
   };
-  function applyPrefs() {
-    document.documentElement.dataset.theme = prefs.theme === 'light' ? '' : prefs.theme;
-    document.documentElement.style.setProperty('--reader-size', prefs.size + 'rem');
-    document.documentElement.style.setProperty('--reader-font', prefs.face === 'serif' ? 'var(--serif)' : 'var(--sans)');
+
+  const clampSize = v => Math.min(SIZE_MAX, Math.max(SIZE_MIN, Number.isFinite(v) ? v : 1.125));
+  const darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
+
+  /** The theme actually painted: `system` resolves against the device here. */
+  function resolvedTheme() {
+    if (prefs.theme !== 'system') return prefs.theme;
+    return darkMedia.matches ? 'dark' : 'light';
   }
+
+  function applyPrefs() {
+    const root = document.documentElement;
+    const theme = resolvedTheme();
+    root.dataset.theme = theme === 'light' ? '' : theme;
+    root.style.setProperty('--reader-size', prefs.size + 'rem');
+    root.style.setProperty('--reader-font', prefs.face === 'serif' ? 'var(--serif)' : 'var(--sans)');
+    const accent = ACCENTS.find(a => a.id === prefs.accent);
+    if (accent?.value) root.style.setProperty('--accent', accent.value);
+    else root.style.removeProperty('--accent');
+    paintBrowserChrome();
+  }
+
+  /* The status bar in a standalone PWA follows theme-color, and both of the
+     tags in the shell carry a media query, so both are kept in step. */
+  function paintBrowserChrome() {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+    if (!bg) return;
+    for (const meta of document.querySelectorAll('meta[name="theme-color"]')) meta.setAttribute('content', bg);
+  }
+
   applyPrefs();
+  darkMedia.addEventListener('change', () => { if (prefs.theme === 'system') applyPrefs(); });
 
   // ── api ──────────────────────────────────────────────────────────────────
   const serverStore = {
@@ -43,6 +95,14 @@
     patch: (id, body) => fetchJson(`/api/articles/${id}`, { method: 'PATCH', body }),
     refetch: (id, source) => fetchJson(`/api/articles/${id}/refetch`, { method: 'POST', body: sourceBody(source) }),
     remove: (id) => fetchJson(`/api/articles/${id}`, { method: 'DELETE' }),
+    removeAll: ({ includeLists } = {}) =>
+      fetchJson(`/api/articles${includeLists ? '?lists=1' : ''}`, { method: 'DELETE' }),
+    listCollections: () => fetchJson('/api/collections'),
+    createCollection: (name) => fetchJson('/api/collections', { method: 'POST', body: { name } }),
+    renameCollection: (id, name) => fetchJson(`/api/collections/${id}`, { method: 'PATCH', body: { name } }),
+    deleteCollection: (id) => fetchJson(`/api/collections/${id}`, { method: 'DELETE' }),
+    setArticleCollection: (id, collectionId, member) =>
+      fetchJson(`/api/articles/${id}/collections/${collectionId}`, { method: 'PUT', body: { member } }),
   };
   const api = DEMO
     ? window.createParticleLocalStore({ fetchJson, maxArticles: DEMO_MAX })
@@ -90,6 +150,8 @@
   async function showLibrary() {
     saveReadingProgress();
     resetNarration();
+    exitTrim();
+    closeMenu();
     reader.hidden = true;
     library.hidden = false;
     progressBar.style.width = '0';
@@ -99,7 +161,13 @@
 
   async function refresh() {
     try {
-      state.articles = await api.list(state.q, state.filter);
+      const [articles, collections] = await Promise.all([
+        api.list(state.q, requestFilter()),
+        loadCollections(),
+      ]);
+      state.articles = articles;
+      state.collections = collections;
+      renderTabs();
       renderList();
     } catch (e) {
       saveStatus.textContent = 'library failed to load: ' + e.message;
@@ -107,10 +175,53 @@
     }
   }
 
+  async function loadCollections() {
+    try { return await api.listCollections(); } catch { return state.collections; }
+  }
+
+  /* `all` means every unarchived article, unless the reader has asked for read
+     ones to stay in their own tab — which is exactly the unread view. */
+  function requestFilter() {
+    if (state.filter === 'all' && !prefs.readsInAll) return 'unread';
+    return state.filter;
+  }
+
+  function tabList() {
+    const built = [
+      { id: 'all', label: 'all' },
+      prefs.readsInAll ? { id: 'unread', label: 'unread' } : { id: 'read', label: 'read' },
+      { id: 'favorites', label: 'favorites' },
+      { id: 'archived', label: 'archive' },
+    ];
+    return built.concat(state.collections.map(c => ({ id: `collection:${c.id}`, label: c.name, list: c })));
+  }
+
+  function renderTabs() {
+    const available = tabList();
+    // a list the reader deleted, or a tab a setting just retired, falls back to all
+    if (!available.some(t => t.id === state.filter)) setFilter('all', { refresh: false });
+    tabs.innerHTML = available.map(tab => `
+      <button data-filter="${esc(tab.id)}" class="tab${tab.id === state.filter ? ' active' : ''}">${esc(tab.label)}</button>
+    `).join('');
+  }
+
+  function setFilter(filter, { refresh: reload = true } = {}) {
+    state.filter = filter;
+    localStorage.setItem('p.filter', filter);
+    if (reload) refresh();
+  }
+
   function renderList() {
     list.innerHTML = '';
     empty.hidden = state.articles.length > 0;
-    for (const a of state.articles) list.appendChild(row(a));
+    if (empty.hidden) {
+      for (const a of state.articles) list.appendChild(row(a));
+      return;
+    }
+    const current = tabList().find(t => t.id === state.filter);
+    $('empty-big').textContent = state.q ? 'nothing matches that'
+      : current?.list ? `“${current.list.name}” is empty`
+        : 'nothing here yet';
   }
 
   function row(a) {
@@ -120,12 +231,14 @@
 
     const mins = Math.max(1, Math.round((a.word_count || 0) / 230));
     const tags = (a.tags || []).join(', ');
+    const lists = collectionNames(a);
     const flag = a.quality === 'partial' || a.quality === 'stub' ? '<span class="row-flag" title="extraction may be incomplete">&#9679; partial</span>' : '';
 
     li.innerHTML = `
       <div class="row-top">
         <span class="row-site">${esc(a.site_name || hostOf(a.url))}</span>
         ${flag}
+        ${lists ? `<span class="row-flag" title="in your lists">${esc(lists)}</span>` : ''}
         ${tags ? `<span class="row-tags">${esc(tags)}</span>` : ''}
       </div>
       <div class="row-title">${esc(a.title || a.url)}</div>
@@ -134,10 +247,13 @@
         <span>${mins} min</span>
         ${a.progress > 0.02 && a.progress < 0.97 ? `<span class="row-progress"><i style="width:${Math.round(a.progress * 100)}%"></i></span>` : ''}
         ${a.read_at ? '<span>read</span>' : ''}
+        ${a.edited_at ? '<span class="row-edited" title="you trimmed this article">trimmed</span>' : ''}
         <span>${relDate(a.saved_at)}</span>
         <span class="row-actions">
           <button class="row-btn ${a.favorite ? 'on' : ''}" data-act="fav" title="favorite">${a.favorite ? '★' : '☆'}</button>
           <button class="row-btn ${a.archived ? 'on' : ''}" data-act="arch" title="${a.archived ? 'unarchive' : 'archive'}">↧</button>
+          <button class="row-btn" data-act="del" title="delete">✕</button>
+          <button class="row-btn row-more" data-act="more" title="lists and more" aria-haspopup="menu">⋯</button>
         </span>
       </div>`;
 
@@ -147,6 +263,8 @@
         ev.stopPropagation();
         if (btn.dataset.act === 'fav') await api.patch(a.id, { favorite: !a.favorite });
         if (btn.dataset.act === 'arch') await api.patch(a.id, { archived: !a.archived });
+        if (btn.dataset.act === 'del') return deleteArticle(a, { after: refresh });
+        if (btn.dataset.act === 'more') return openArticleMenu(btn, a, { after: refresh });
         refresh();
         return;
       }
@@ -156,6 +274,26 @@
       if (ev.key === 'Enter') go(`/read/${a.id}`);
     });
     return li;
+  }
+
+  const collectionNames = a => state.collections
+    .filter(list => (a.collections || []).includes(list.id))
+    .map(list => list.name)
+    .join(' · ');
+
+  /* One confirmation, one wording, wherever delete is reached from. */
+  async function deleteArticle(article, { after } = {}) {
+    const title = article.title || article.url;
+    const short = title.length > 60 ? `${title.slice(0, 57)}…` : title;
+    if (!confirm(`Delete “${short}” from your library?\n\nThis cannot be undone.`)) return false;
+    try {
+      await api.remove(article.id);
+    } catch (e) {
+      alert(`could not delete that article: ${e.message}`);
+      return false;
+    }
+    after?.();
+    return true;
   }
 
   // ── save ─────────────────────────────────────────────────────────────────
@@ -221,13 +359,10 @@
   tabs.addEventListener('click', (ev) => {
     const tab = ev.target.closest('.tab');
     if (!tab) return;
-    state.filter = tab.dataset.filter;
-    localStorage.setItem('p.filter', state.filter);
     tabs.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab));
-    refresh();
+    setFilter(tab.dataset.filter);
   });
-  // restore filter tab
-  tabs.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.filter === state.filter));
+  renderTabs();
 
   let searchTimer;
   search.addEventListener('input', () => {
@@ -241,6 +376,8 @@
     try { a = await api.get(id); }
     catch { return go('/'); }
     resetNarration();
+    exitTrim({ restore: false });
+    closeMenu();
     state.current = a;
 
     library.hidden = true;
@@ -342,11 +479,12 @@
   }
 
   $('back-btn').addEventListener('click', () => go('/'));
-  $('font-smaller').addEventListener('click', () => prefs.size = Math.max(0.85, +(prefs.size - 0.0625).toFixed(4)));
-  $('font-larger').addEventListener('click', () => prefs.size = Math.min(1.6, +(prefs.size + 0.0625).toFixed(4)));
+  $('font-smaller').addEventListener('click', () => prefs.size = +(prefs.size - SIZE_STEP).toFixed(4));
+  $('font-larger').addEventListener('click', () => prefs.size = +(prefs.size + SIZE_STEP).toFixed(4));
   $('font-face').addEventListener('click', () => prefs.face = prefs.face === 'serif' ? 'sans' : 'serif');
   $('theme-btn').addEventListener('click', () => {
-    prefs.theme = { light: 'sepia', sepia: 'dark', dark: 'light' }[prefs.theme] || 'light';
+    prefs.theme = THEMES[(THEMES.indexOf(prefs.theme) + 1) % THEMES.length];
+    if (!sheet.hidden) syncSettings();
   });
   $('fav-btn').addEventListener('click', async () => {
     if (!state.current) return;
@@ -359,16 +497,266 @@
     updateFavUi(state.current);
   });
   $('a-refetch').addEventListener('click', () => state.current && doRefetch(state.current.id));
-  $('a-delete').addEventListener('click', async () => {
-    if (!state.current) return;
-    if (!confirm('Delete this article from your library?')) return;
-    await api.remove(state.current.id);
-    go('/');
+  $('a-delete').addEventListener('click', () => {
+    if (state.current) deleteArticle(state.current, { after: () => go('/') });
   });
+  $('more-btn').addEventListener('click', (ev) => {
+    if (!state.current) return;
+    ev.stopPropagation();
+    openArticleMenu($('more-btn'), state.current, {
+      inReader: true,
+      after: async () => { state.current = await api.get(state.current.id).catch(() => state.current); },
+      onDelete: () => go('/'),
+    });
+  });
+
+  // ── article menu ─────────────────────────────────────────────────────────
+  // The lists an article belongs to, then the things that change the article
+  // itself. Same menu in the library row and in the reader bar.
+  const menu = $('menu');
+  let menuAnchor = null;
+
+  function openArticleMenu(anchor, article, { inReader = false, after, onDelete } = {}) {
+    if (menuAnchor === anchor && !menu.hidden) return closeMenu();
+    const lists = state.collections;
+    const memberOf = new Set(article.collections || []);
+    menu.innerHTML = `
+      <p class="menu-label">lists</p>
+      ${lists.length
+        ? lists.map(list => `
+          <button class="menu-item" role="menuitem" data-list="${list.id}" aria-checked="${memberOf.has(list.id)}">
+            <span class="menu-tick">${memberOf.has(list.id) ? '✓' : ''}</span>
+            <span class="menu-name">${esc(list.name)}</span>
+          </button>`).join('')
+        : '<p class="menu-empty">no lists yet — make one in settings</p>'}
+      <div class="menu-sep"></div>
+      ${inReader ? '<button class="menu-item" role="menuitem" data-do="trim"><span class="menu-tick">✂</span><span class="menu-name">trim sections…</span></button>' : ''}
+      ${inReader ? '<button class="menu-item" role="menuitem" data-do="refetch"><span class="menu-tick">↻</span><span class="menu-name">re-extract</span></button>' : ''}
+      <button class="menu-item" role="menuitem" data-do="open"><span class="menu-tick">↗</span><span class="menu-name">view original</span></button>
+      <button class="menu-item danger" role="menuitem" data-do="delete"><span class="menu-tick">✕</span><span class="menu-name">delete article</span></button>`;
+
+    menu.hidden = false;
+    menuAnchor = anchor;
+    placeMenu(anchor);
+
+    menu.onclick = async (ev) => {
+      const item = ev.target.closest('[data-list], [data-do]');
+      if (!item) return;
+      ev.stopPropagation();
+
+      if (item.dataset.list) {
+        const listId = Number(item.dataset.list);
+        const member = item.getAttribute('aria-checked') !== 'true';
+        try {
+          const updated = await api.setArticleCollection(article.id, listId, member);
+          article.collections = updated.collections || [];
+        } catch (e) {
+          return alert(`could not update that list: ${e.message}`);
+        }
+        item.setAttribute('aria-checked', String(member));
+        item.querySelector('.menu-tick').textContent = member ? '✓' : '';
+        if (!inReader) refresh();
+        return;
+      }
+
+      closeMenu();
+      if (item.dataset.do === 'open') window.open(article.url, '_blank', 'noopener');
+      if (item.dataset.do === 'refetch') doRefetch(article.id);
+      if (item.dataset.do === 'trim') enterTrim();
+      if (item.dataset.do === 'delete') {
+        const gone = await deleteArticle(article, { after: onDelete || after });
+        if (gone && !onDelete) refresh();
+      }
+    };
+  }
+
+  function placeMenu(anchor) {
+    const box = anchor.getBoundingClientRect();
+    const size = menu.getBoundingClientRect();
+    const pad = 8;
+    const left = Math.min(Math.max(pad, box.right - size.width), window.innerWidth - size.width - pad);
+    const below = box.bottom + 6;
+    const top = below + size.height > window.innerHeight - pad
+      ? Math.max(pad, box.top - size.height - 6)
+      : below;
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+  }
+
+  function closeMenu() {
+    menu.hidden = true;
+    menu.onclick = null;
+    menuAnchor = null;
+  }
+
+  document.addEventListener('pointerdown', (ev) => {
+    if (menu.hidden) return;
+    if (menu.contains(ev.target) || menuAnchor?.contains(ev.target)) return;
+    closeMenu();
+  });
+  window.addEventListener('resize', closeMenu);
+  window.addEventListener('scroll', closeMenu, { passive: true, capture: true });
+
+  // ── trim ─────────────────────────────────────────────────────────────────
+  /* Hand-editing a saved article. Nothing is written until the reader confirms:
+     marks are made on the live DOM, the pre-trim markup is held aside so cancel
+     is exact, and the saved copy is only rewritten by "remove & save". */
+  const trim = { on: false, snapshot: '' };
+  const TRIM_BLOCKS = 'p, h1, h2, h3, h4, h5, h6, blockquote, figure, figcaption, pre, li, ul, ol, table, hr, dl';
+
+  function enterTrim() {
+    if (!state.current || reader.hidden || trim.on) return;
+    stopNarration();
+    trim.on = true;
+    trim.snapshot = $('a-body').innerHTML;
+    document.documentElement.dataset.editing = '1';
+    $('trim-bar').hidden = false;
+    updateTrimCount();
+  }
+
+  function exitTrim({ restore = true } = {}) {
+    if (!trim.on) return;
+    if (restore) $('a-body').innerHTML = trim.snapshot;
+    trim.on = false;
+    trim.snapshot = '';
+    delete document.documentElement.dataset.editing;
+    $('trim-bar').hidden = true;
+  }
+
+  function marks() { return [...$('a-body').querySelectorAll('.trim-mark')]; }
+
+  function updateTrimCount() {
+    const n = marks().length;
+    $('trim-count').textContent = n ? `${n} section${n === 1 ? '' : 's'} marked` : 'nothing marked';
+    $('trim-apply').disabled = n === 0;
+  }
+
+  /** The outermost block under a click, so tapping a caption marks its figure. */
+  function blockAt(node) {
+    const body = $('a-body');
+    let block = node.closest?.(TRIM_BLOCKS) || node.parentElement?.closest(TRIM_BLOCKS);
+    for (let up = block?.parentElement?.closest(TRIM_BLOCKS); up && body.contains(up); up = up.parentElement?.closest(TRIM_BLOCKS)) {
+      block = up;
+    }
+    if (block && body.contains(block)) return block;
+    // an unwrapped div/section child of the body still gets to be a target
+    let child = node.nodeType === 1 ? node : node.parentElement;
+    while (child && child.parentElement !== body) child = child.parentElement;
+    return child && child !== body ? child : null;
+  }
+
+  function unmark(node) {
+    if (node.dataset?.trimSpan === '1') node.replaceWith(...node.childNodes);
+    else node.classList.remove('trim-mark');
+  }
+
+  $('a-body').addEventListener('click', (ev) => {
+    if (!trim.on) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    // a click that ends a drag-selection is the reader choosing text, not a block
+    if (!window.getSelection()?.isCollapsed) return;
+    const existing = ev.target.closest('.trim-mark');
+    if (existing) { unmark(existing); return updateTrimCount(); }
+    const block = blockAt(ev.target);
+    if (!block || block === $('a-body')) return;
+    block.classList.add('trim-mark');
+    updateTrimCount();
+  }, true);
+
+  /* A selection inside one block marks exactly that run of text; one that
+     crosses blocks marks each block it touches, which is what a reader dragging
+     over three paragraphs means. */
+  function markSelection() {
+    const body = $('a-body');
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return 0;
+    const range = selection.getRangeAt(0);
+    if (!body.contains(range.commonAncestorContainer)) return 0;
+
+    const touched = [...body.querySelectorAll(TRIM_BLOCKS)]
+      .filter(block => range.intersectsNode(block) && !block.parentElement.closest('.trim-mark'));
+    const spansBlocks = touched.filter(block => !block.querySelector(TRIM_BLOCKS)).length > 1;
+
+    if (spansBlocks) {
+      for (const block of touched) {
+        if (block.closest('.trim-mark')) continue;
+        block.classList.add('trim-mark');
+      }
+    } else {
+      const span = document.createElement('span');
+      span.className = 'trim-mark';
+      span.dataset.trimSpan = '1';
+      try {
+        span.appendChild(range.extractContents());
+        range.insertNode(span);
+      } catch {
+        const block = blockAt(range.startContainer);
+        if (block) block.classList.add('trim-mark');
+      }
+    }
+    selection.removeAllRanges();
+    updateTrimCount();
+    return marks().length;
+  }
+
+  $('trim-selection').addEventListener('click', () => {
+    if (!markSelection()) $('trim-count').textContent = 'select some article text first';
+  });
+  $('trim-cancel').addEventListener('click', () => exitTrim());
+
+  $('trim-apply').addEventListener('click', async () => {
+    const count = marks().length;
+    if (!count || !state.current) return;
+    if (!confirm(`Remove ${count} marked section${count === 1 ? '' : 's'} from your saved copy?\n\n`
+      + 'This rewrites what particle stores for this article. There is no undo — '
+      + 're-extracting the article is the only way back to the original.')) return;
+
+    const html = trimmedHtml();
+    if (!html) return alert('that would remove the whole article — delete it instead if that is what you want.');
+
+    $('trim-apply').disabled = true;
+    $('trim-count').textContent = 'saving…';
+    try {
+      const updated = await api.patch(state.current.id, { content_html: html });
+      exitTrim({ restore: false });
+      state.current = updated;
+      openReader(updated.id);
+    } catch (e) {
+      $('trim-count').textContent = `could not save: ${e.message}`;
+      $('trim-apply').disabled = false;
+    }
+  });
+
+  /** The body without its marked passages, and without the classes this page
+      added for display, in the form the library stores. */
+  function trimmedHtml() {
+    const clone = $('a-body').cloneNode(true);
+    for (const node of clone.querySelectorAll('.trim-mark')) node.remove();
+    for (const node of clone.querySelectorAll('.is-narrating, .dropcap')) {
+      node.classList.remove('is-narrating', 'dropcap');
+      if (!node.getAttribute('class')) node.removeAttribute('class');
+    }
+    // a partial removal can leave an empty paragraph behind
+    for (const node of clone.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, blockquote, figcaption')) {
+      if (!node.textContent.trim() && !node.querySelector('img, video, audio, iframe')) node.remove();
+    }
+    if (!clone.textContent.trim() && !clone.querySelector('img')) return '';
+    let html = clone.innerHTML.trim();
+    // images are shown through a base-prefixed proxy path; store the plain one
+    if (BASE) html = html.replaceAll(`src="${BASE}/api/`, 'src="/api/');
+    return html;
+  }
 
   // ── keyboard ─────────────────────────────────────────────────────────────
   document.addEventListener('keydown', (ev) => {
     if (ev.target.matches('input, textarea')) return;
+    if (!menu.hidden && ev.key === 'Escape') return closeMenu();
+    if (trim.on) {
+      if (ev.key === 'Escape') exitTrim();
+      if (ev.key === 'Backspace' || ev.key === 'Delete') { ev.preventDefault(); markSelection(); }
+      return;
+    }
     if (!reader.hidden) {
       const listening = !$('player').hidden;
       if (ev.key === 'Escape') go('/');
@@ -1091,6 +1479,178 @@
 
   scroller.addEventListener('scroll', () => { player.lastScrollAt = Date.now(); }, { passive: true });
 
+  // ── settings ─────────────────────────────────────────────────────────────
+  // Display choices, the lists, and the one destructive action, in one sheet
+  // reached from the library. Every control writes through immediately; there
+  // is no save button and nothing to lose by closing.
+  const sheet = $('settings');
+  let lastFocus = null;
+
+  function openSettings() {
+    lastFocus = document.activeElement;
+    closeMenu();
+    sheet.hidden = false;
+    syncSettings();
+    renderSettingsLists();
+    sheet.querySelector('.sheet-x').focus();
+  }
+
+  function closeSettings() {
+    if (sheet.hidden) return;
+    sheet.hidden = true;
+    $('set-reset-confirm').value = '';
+    $('set-reset').disabled = true;
+    $('set-reset-status').hidden = true;
+    $('set-list-error').hidden = true;
+    lastFocus?.focus?.();
+  }
+
+  $('settings-btn').addEventListener('click', openSettings);
+  sheet.addEventListener('click', (ev) => { if (ev.target.closest('[data-close]')) closeSettings(); });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !sheet.hidden) closeSettings();
+  });
+
+  /** Paint every control from the prefs it reflects. */
+  function syncSettings() {
+    pickSeg($('set-theme'), prefs.theme);
+    pickSeg($('set-face'), prefs.face);
+    pickSeg($('set-reads'), prefs.readsInAll ? '1' : '0');
+    const size = $('set-size');
+    size.min = SIZE_MIN; size.max = SIZE_MAX; size.step = SIZE_STEP;
+    size.value = prefs.size;
+    for (const swatch of $('set-accent').children) {
+      swatch.setAttribute('aria-checked', String(swatch.dataset.value === prefs.accent));
+    }
+  }
+
+  function pickSeg(group, value) {
+    for (const button of group.children) {
+      button.setAttribute('aria-checked', String(button.dataset.value === String(value)));
+    }
+  }
+
+  function onSeg(group, handler) {
+    group.addEventListener('click', (ev) => {
+      const button = ev.target.closest('button[data-value]');
+      if (!button) return;
+      handler(button.dataset.value);
+      syncSettings();
+    });
+  }
+
+  onSeg($('set-theme'), value => { prefs.theme = value; });
+  onSeg($('set-face'), value => { prefs.face = value; });
+  onSeg($('set-reads'), (value) => {
+    prefs.readsInAll = value === '1';
+    // the retired tab may be the one being shown; renderTabs falls back to all
+    refresh();
+  });
+  $('set-size').addEventListener('input', (ev) => { prefs.size = parseFloat(ev.target.value); });
+
+  $('set-accent').innerHTML = ACCENTS.map(accent => `
+    <button type="button" class="swatch" role="radio" data-value="${accent.id}"
+            title="${esc(accent.label)}" aria-label="${esc(accent.label)}"
+            style="background:${accent.swatch}"></button>`).join('');
+  $('set-accent').addEventListener('click', (ev) => {
+    const swatch = ev.target.closest('[data-value]');
+    if (!swatch) return;
+    prefs.accent = swatch.dataset.value;
+    syncSettings();
+  });
+
+  // ── lists ────────────────────────────────────────────────────────────────
+  async function renderSettingsLists() {
+    state.collections = await loadCollections();
+    const mount = $('set-lists');
+    mount.innerHTML = state.collections.map(list => `
+      <li class="set-list" data-id="${list.id}">
+        <input class="set-list-name" value="${esc(list.name)}" maxlength="40" aria-label="List name">
+        <span class="set-list-count">${list.count || 0}</span>
+        <button class="set-list-x" type="button" title="delete list" aria-label="Delete ${esc(list.name)}">&times;</button>
+      </li>`).join('');
+    renderTabs();
+  }
+
+  function listError(message) {
+    const box = $('set-list-error');
+    box.hidden = !message;
+    box.textContent = message || '';
+  }
+
+  $('set-newlist').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const input = $('set-listname');
+    const name = input.value.trim();
+    if (!name) return;
+    try {
+      await api.createCollection(name);
+      input.value = '';
+      listError('');
+      await renderSettingsLists();
+    } catch (e) {
+      listError(e.message);
+    }
+  });
+
+  $('set-lists').addEventListener('click', async (ev) => {
+    const row = ev.target.closest('.set-list');
+    if (!row || !ev.target.closest('.set-list-x')) return;
+    const name = row.querySelector('.set-list-name').value;
+    if (!confirm(`Delete the list “${name}”?\n\nThe articles in it stay in your library.`)) return;
+    await api.deleteCollection(Number(row.dataset.id));
+    await renderSettingsLists();
+    refresh();
+  });
+
+  $('set-lists').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && ev.target.matches('.set-list-name')) ev.target.blur();
+  });
+
+  $('set-lists').addEventListener('focusout', async (ev) => {
+    if (!ev.target.matches('.set-list-name')) return;
+    const row = ev.target.closest('.set-list');
+    const id = Number(row.dataset.id);
+    const list = state.collections.find(item => item.id === id);
+    const name = ev.target.value.trim();
+    if (!list || !name || name === list.name) { ev.target.value = list?.name || name; return; }
+    try {
+      await api.renameCollection(id, name);
+      listError('');
+      await renderSettingsLists();
+      refresh();
+    } catch (e) {
+      listError(e.message);
+      ev.target.value = list.name;
+    }
+  });
+
+  // ── reset ────────────────────────────────────────────────────────────────
+  $('set-reset-confirm').addEventListener('input', (ev) => {
+    $('set-reset').disabled = ev.target.value.trim().toUpperCase() !== 'DELETE';
+  });
+
+  $('set-reset').addEventListener('click', async () => {
+    const includeLists = $('set-reset-lists').checked;
+    if (!confirm(`Delete every saved article${includeLists ? ' and every list' : ''}?\n\n`
+      + 'This is permanent. Nothing is exported and nothing can be recovered.')) return;
+    const status = $('set-reset-status');
+    $('set-reset').disabled = true;
+    status.hidden = false;
+    status.textContent = 'deleting…';
+    try {
+      const result = await api.removeAll({ includeLists });
+      status.textContent = `deleted ${result?.deleted ?? 'every'} article${result?.deleted === 1 ? '' : 's'}.`;
+      $('set-reset-confirm').value = '';
+      $('set-reset-lists').checked = false;
+      await renderSettingsLists();
+      go('/');
+    } catch (e) {
+      status.textContent = `reset failed: ${e.message}`;
+      $('set-reset').disabled = false;
+    }
+  });
+
   // ── helpers ──────────────────────────────────────────────────────────────
   function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1121,14 +1681,14 @@
 
   // Narration needs a text-to-speech key on the server; without one the reader
   // never offers it.
-  if (!DEMO) {
-    fetchJson('/api/health')
-      .then((health) => {
-        state.narration = Boolean(health.narration);
-        if (state.narration && !reader.hidden) $('listen-btn').hidden = false;
-      })
-      .catch(() => {});
-  }
+  fetchJson('/api/health')
+    .then((health) => {
+      $('set-version').textContent = `particle ${health.version || ''}`.trim();
+      if (DEMO) return;
+      state.narration = Boolean(health.narration);
+      if (state.narration && !reader.hidden) $('listen-btn').hidden = false;
+    })
+    .catch(() => {});
 
   // ── pwa ──────────────────────────────────────────────────────────────────
   if (!DEMO && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {

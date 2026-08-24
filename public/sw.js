@@ -1,13 +1,13 @@
 /* particle service worker — app shell offline + read-offline for visited articles */
-const SHELL = 'particle-shell-v5';
-const RUNTIME = 'particle-runtime-v5';
+const SHELL = 'particle-shell-v6';
+const RUNTIME = 'particle-runtime-v6';
 const BASE = new URL(self.registration.scope).pathname.replace(/\/$/, '');
 const at = path => `${BASE}${path}` || '/';
 // Keep this list to assets that always exist — cache.addAll() rejects as a whole
 // if any single entry 404s, which would leave the app with no service worker.
 const SHELL_ASSETS = [
   at('/'), at('/style.css'), at('/app.js'), at('/store-local.js'), at('/manifest.webmanifest'),
-  at('/logo.png'), at('/logo-dark.png'), at('/icons/icon-192.png'), at('/icons/icon-512.png'),
+  at('/icons/icon-192.png'), at('/icons/icon-512.png'),
 ];
 
 self.addEventListener('install', (e) => {
