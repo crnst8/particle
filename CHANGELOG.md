@@ -1,3 +1,9 @@
+## 1.2.0 — 2026-08-24
+
+- **Settings page**: theme, accent, typeface & size defaults, library vis, lists & reset
+- **Delete items**: you can now delete items, an overlooked feature
+- **Adjusted view**: simplified the logo & ux
+
 ## 1.1.1 — 2026-08-23
 
 - fix: lockscreen playback & tts fine-tuning
