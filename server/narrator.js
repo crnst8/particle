@@ -2,6 +2,7 @@
 // segments, synthesising them the first time they are asked for and caching the
 // bytes next to the article. Playback drives synthesis, so an article opened and
 // abandoned after a paragraph costs one paragraph.
+import { createHash } from 'node:crypto';
 import { synthesize, isTtsConfigured, audioFormat, audioMime } from './tts.js';
 import { planNarration, contentHash, segmentStyle } from './narration.js';
 
@@ -18,16 +19,19 @@ export function createNarrator(store) {
   /** Plan or reuse a narration. Rebuilds when the article, or the chosen voice, changed. */
   async function ensure(article, { force = false, voiceId = null } = {}) {
     const existing = store.getNarration(article.id);
-    const fresh = existing
-      && existing.content_hash === contentHash(article)
-      && (!voiceId || existing.voice_id === voiceId);
+    const sameText = existing && existing.content_hash === contentHash(article);
+    const fresh = sameText && (!voiceId || existing.voice_id === voiceId);
     if (fresh && !force) return existing;
 
+    // Swapping the voice on a script that already reads well keeps the direction
+    // that was written for this article; a recast throws it out and starts over.
+    const reuse = !force && voiceId && sameText ? existing.direction : null;
+
     // Two requests for the same casting share one plan; a different voice does not.
-    const planKey = `${article.id}:${voiceId || ''}`;
+    const planKey = `${article.id}:${voiceId || ''}:${force ? 'force' : ''}`;
     if (planning.has(planKey)) return planning.get(planKey);
     const job = (async () => {
-      const { direction, script, language, contentHash: hash } = await planNarration(article, { voiceId });
+      const { direction, script, language, contentHash: hash } = await planNarration(article, { voiceId, reuse });
       // A new script means the old audio no longer lines up with it.
       store.deleteNarration(article.id);
       return store.saveNarration(article.id, {
@@ -53,7 +57,10 @@ export function createNarrator(store) {
     const cached = store.getNarrationSegment(article.id, seq);
     if (cached) return { audio: Buffer.from(cached.audio), duration: cached.duration, cached: true };
 
-    const key = `${article.id}:${seq}`;
+    // The revision is in the key: a request made after a recast must not be
+    // answered by synthesis still running for the voice it replaced.
+    const rev = narrationRev(narration);
+    const key = `${article.id}:${rev}:${seq}`;
     if (inFlight.has(key)) return inFlight.get(key);
 
     const spec = narration.script.segments?.[seq];
@@ -70,6 +77,13 @@ export function createNarrator(store) {
         topP: style.topP,
         pauseMs: spec.pause || 0,
       });
+      // A recast while this was in the air leaves it orphaned: the segment
+      // numbers are the same, so keeping it would file the old voice under the
+      // new casting.
+      const live = store.getNarration(article.id);
+      if (!live || narrationRev(live) !== rev) {
+        throw Object.assign(new Error('the narration was recast'), { statusCode: 409 });
+      }
       store.saveNarrationSegment(article.id, seq, audio, duration);
       store.pruneNarrationAudio(MAX_CACHE_BYTES, article.id);
       return { audio, duration, cached: false };
@@ -104,6 +118,7 @@ export function createNarrator(store) {
     }));
     return {
       article_id: article.id,
+      rev: narrationRev(narration),
       language: narration.language,
       format: narration.format || audioFormat,
       mime: audioMime,
@@ -142,7 +157,22 @@ export function createNarrator(store) {
     }
   }
 
-  return { ensure, segment, warm, manifest, drop: id => store.deleteNarration(id), enabled: isTtsConfigured };
+  return {
+    ensure, segment, warm, manifest,
+    rev: narrationRev,
+    drop: id => store.deleteNarration(id),
+    enabled: isTtsConfigured,
+  };
+}
+
+/* A casting's fingerprint: it moves whenever the script or the voice does. The
+   segment URLs carry it, which is what lets the audio be cached hard and still
+   never hand back a paragraph in a voice the reader has just replaced. */
+export function narrationRev(narration) {
+  return createHash('sha1')
+    .update(`${narration?.content_hash || ''}|${narration?.voice_id || ''}|${narration?.created_at || ''}`)
+    .digest('hex')
+    .slice(0, 10);
 }
 
 /* Before a segment is synthesised its length is a guess, and the player needs

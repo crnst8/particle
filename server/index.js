@@ -391,6 +391,7 @@ function registerNarrationRoutes(router) {
     if (!article) return;
     const existing = store.getNarration(article.id);
     if (!existing) return res.status(404).json({ error: 'not narrated yet' });
+    res.set('Cache-Control', 'no-store');
     res.json(narrator.manifest(article, existing));
   });
 
@@ -404,6 +405,7 @@ function registerNarrationRoutes(router) {
         voiceId: typeof req.body?.voice_id === 'string' ? req.body.voice_id.trim() : null,
       });
       const manifest = narrator.manifest(article, narration);
+      res.set('Cache-Control', 'no-store');
       res.json(manifest);
       narrator.warm(article, narration, Math.max(0, Number(req.body?.from) || 0));
     } catch (error) {
@@ -423,7 +425,7 @@ function registerNarrationRoutes(router) {
     try {
       const { audio, duration } = await narrator.segment(article, narration, seq);
       store.touchNarration(article.id);
-      sendAudio(req, res, audio, { duration });
+      sendAudio(req, res, audio, { duration, rev: narrator.rev(narration), asked: String(req.query.v || '') });
       narrator.warm(article, narration, seq + 1);
     } catch (error) {
       res.status(error.statusCode || 502).json({ error: error.message });
@@ -440,9 +442,12 @@ function registerNarrationRoutes(router) {
 
 // Segments are small and complete, but Safari will not start playback without a
 // range answer, so give it one.
-function sendAudio(req, res, audio, { duration }) {
+function sendAudio(req, res, audio, { duration, rev, asked }) {
   res.set('Content-Type', 'audio/mpeg');
-  res.set('Cache-Control', 'private, max-age=604800, immutable');
+  // The URL carries the casting's revision, so an answer that matches keeps for
+  // a week. Anything else is the article's *current* audio under a stale name —
+  // recasting reuses the segment numbers — and must not be remembered.
+  res.set('Cache-Control', rev && asked === rev ? 'private, max-age=604800, immutable' : 'no-store');
   res.set('X-Narration-Duration', String(duration));
   res.set('Accept-Ranges', 'bytes');
 

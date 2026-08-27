@@ -421,10 +421,27 @@ export function detectLanguage(text = '') {
  * With an LLM configured the choice of voice, pace and awkward-word
  * pronunciations comes from reading the piece; without one the tags and the
  * catalogue's own labels do the work.
+ *
+ * `reuse` is the direction of a narration of this same text. When the reader
+ * picks a voice there is nothing left to decide — the pacing and the awkward
+ * words belong to the article, not to whoever reads it — so the direction is
+ * carried over and no model is asked again. That is what makes a swap quick.
  */
-export async function planNarration(article, { voiceId } = {}) {
+export async function planNarration(article, { voiceId, reuse } = {}) {
   const language = detectLanguage(article.text_content || '');
   const profile = toneProfile(article);
+
+  if (voiceId && reuse && !VOICE_LOCKED) {
+    const direction = {
+      ...reuse,
+      voice_id: voiceId,
+      voice_name: await voiceTitle(voiceId, language),
+      source: 'manual',
+      reason: reuse.reason || `${profile.id} tone, chosen from the article's subject and length`,
+    };
+    return { direction, script: buildScript(article, direction), language, contentHash: contentHash(article) };
+  }
+
   const voices = VOICE_LOCKED ? [] : await listVoices(language);
   const ranked = shortlistVoices(article, voices, profile);
 
@@ -472,6 +489,16 @@ export async function planNarration(article, { voiceId } = {}) {
   }
 
   return { direction, script: buildScript(article, direction), language, contentHash: contentHash(article) };
+}
+
+async function voiceTitle(voiceId, language) {
+  const known = knownVoice(voiceId);
+  if (known?.title) return known.title;
+  try {
+    return (await listVoices(language)).find(voice => voice.id === voiceId)?.title || 'chosen voice';
+  } catch {
+    return 'chosen voice';
+  }
 }
 
 function applySuggestion(direction, suggested, ranked) {

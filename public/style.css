@@ -163,6 +163,75 @@ input { font: inherit; color: inherit; }
 }
 .save-status.error { color: var(--warn); }
 .save-status a { color: inherit; }
+
+/* ── Save confirmation ─────────────────────────────────────────────────────
+   Saving is the one moment the app should answer back. Four quiet beats in the
+   accent, all done inside a second: the rule under the field sweeps across,
+   the mark pulses once, the status line lands with a dot, and the new row
+   opens at the top of the list rather than shoving it down. Decoration only —
+   nothing here gates the save, and reduced motion drops all of it. */
+
+#save-form { position: relative; }
+#save-form::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -2px; height: 2px;
+  background: var(--accent); opacity: 0; pointer-events: none;
+  transform: scaleX(0); transform-origin: left center;
+}
+#save-form.is-saved::after { animation: save-sweep .62s cubic-bezier(.22,.61,.36,1) both; }
+@keyframes save-sweep {
+  0%   { transform: scaleX(0); opacity: 1; }
+  55%  { transform: scaleX(1); opacity: 1; }
+  100% { transform: scaleX(1); opacity: 0; }
+}
+
+.brand-dot { position: relative; }
+.brand-dot::after {
+  content: ''; position: absolute; inset: 0;
+  border: 1.5px solid var(--accent); border-radius: 50%; opacity: 0;
+}
+.brand-dot.is-saved { animation: save-dot .5s cubic-bezier(.34,1.56,.64,1) both; }
+.brand-dot.is-saved::after { animation: save-ring .8s cubic-bezier(.16,1,.3,1) both; }
+@keyframes save-dot {
+  0% { transform: scale(1); } 35% { transform: scale(.88); } 100% { transform: scale(1); }
+}
+@keyframes save-ring {
+  0%   { transform: scale(1); opacity: .5; }
+  100% { transform: scale(2.7); opacity: 0; }
+}
+
+.save-status.ok { color: var(--ink); animation: save-said .38s ease both; }
+.save-status.ok::before {
+  content: '\25CF'; display: inline-block; margin-right: .4rem;
+  font-size: .5em; vertical-align: .28em; color: var(--accent);
+  animation: save-mark .42s cubic-bezier(.34,1.56,.64,1) both;
+}
+@keyframes save-said {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes save-mark { from { transform: scale(0); } to { transform: scale(1); } }
+
+/* The new row grows into place; --row-h is measured in JS because there is
+   nothing to animate to from `auto`. Both are dropped once it has landed. */
+.article-row.is-new {
+  overflow: hidden;
+  animation: save-row .52s cubic-bezier(.22,.61,.36,1) both;
+}
+.article-row.is-new::before {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(100deg,
+    color-mix(in srgb, var(--accent) 13%, transparent),
+    color-mix(in srgb, var(--accent) 4%, transparent) 45%, transparent 78%);
+  animation: save-wash 1.15s ease-out .1s both;
+}
+.article-row.is-new .row-title { animation: save-title .6s ease-out both; }
+@keyframes save-row {
+  from { height: 0; opacity: 0; padding-top: 0; padding-bottom: 0; }
+  60%  { opacity: 1; }
+  to   { height: var(--row-h); opacity: 1; padding-top: 1.15rem; padding-bottom: 1.05rem; }
+}
+@keyframes save-wash { from { opacity: 1; } to { opacity: 0; } }
+@keyframes save-title { 0%, 42% { color: var(--accent); } 100% { color: var(--ink); } }
 .demo-nudge {
   margin: .8rem 0 0; padding: .8rem 1rem; border-left: 2px solid var(--accent);
   background: var(--card); color: var(--ink-2); font-size: .8rem; line-height: 1.5;
@@ -539,6 +608,10 @@ input { font: inherit; color: inherit; }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
+  #save-form::after, .brand-dot, .brand-dot::after, .save-status.ok,
+  .save-status.ok::before, .article-row.is-new, .article-row.is-new::before,
+  .article-row.is-new .row-title { animation: none !important; }
+  .article-row.is-new::before { display: none; }
 }
 
 /* ── Narration ────────────────────────────────────────────────────────────
@@ -677,6 +750,9 @@ input { font: inherit; color: inherit; }
   background: var(--card);
 }
 .pl-voice:hover { border-color: var(--ink-3); }
+/* the voice currently reading, so the list says where you already are */
+.pl-voice.is-cast { border-color: var(--accent); }
+.pl-voice.is-cast .pl-voice-name::after { content: ' · reading'; color: var(--ink-3); }
 .pl-voice-name { color: var(--ink); font-size: .78rem; }
 .pl-voice-tags { color: var(--ink-3); font-size: .68rem; }
 

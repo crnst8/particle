@@ -18,6 +18,7 @@
     current: null,       // article open in reader
     progressTimer: null,
     narration: false,    // server has a text-to-speech key configured
+    justSaved: null,     // id of the article whose row still owes an entrance
   };
 
   // ── prefs ────────────────────────────────────────────────────────────────
@@ -171,6 +172,7 @@
       renderList();
     } catch (e) {
       saveStatus.textContent = 'library failed to load: ' + e.message;
+      saveStatus.classList.remove('ok');
       saveStatus.classList.add('error');
     }
   }
@@ -215,13 +217,58 @@
     list.innerHTML = '';
     empty.hidden = state.articles.length > 0;
     if (empty.hidden) {
-      for (const a of state.articles) list.appendChild(row(a));
+      for (const a of state.articles) {
+        const li = row(a);
+        list.appendChild(li);
+        if (state.justSaved === a.id) openRow(li);
+      }
       return;
     }
     const current = tabList().find(t => t.id === state.filter);
     $('empty-big').textContent = state.q ? 'nothing matches that'
       : current?.list ? `“${current.list.name}” is empty`
         : 'nothing here yet';
+  }
+
+  /* ── save confirmation ───────────────────────────────────────────────────
+     Decoration, and deliberately fire-and-forget: every one of these is safe to
+     lose, so nothing in the save path waits on or branches off them. */
+
+  /* Restart from the top even if the reader saves twice in a row, then hand the
+     element back to its resting styles once every animation on it has finished. */
+  function replay(el, cls) {
+    if (!el) return;
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+    settled(el).then(() => el.classList.remove(cls));
+  }
+
+  const settled = el => Promise.allSettled(
+    (el.getAnimations?.({ subtree: true }) || []).map(anim => anim.finished));
+
+  /* The row is claimed by id rather than animated here: it may not exist yet,
+     and under some filters it never renders at all — hence the expiry. */
+  let saveFlourish;
+  function celebrateSave(id) {
+    state.justSaved = id;
+    clearTimeout(saveFlourish);
+    saveFlourish = setTimeout(() => { state.justSaved = null; }, 10000);
+    saveStatus.classList.add('ok');
+    replay(form, 'is-saved');
+    replay($('brand-dot'), 'is-saved');
+  }
+
+  /* The row grows into place instead of shoving the list down. Its height has
+     to be measured here — there is nothing for CSS to animate to from `auto`. */
+  function openRow(li) {
+    state.justSaved = null;
+    li.style.setProperty('--row-h', `${li.offsetHeight}px`);
+    li.classList.add('is-new');
+    settled(li).then(() => {
+      li.classList.remove('is-new');
+      li.style.removeProperty('--row-h');
+    });
   }
 
   function row(a) {
@@ -302,7 +349,7 @@
     const url = urlInput.value.trim();
     if (!url) return;
     saveBtn.disabled = true;
-    saveStatus.classList.remove('error');
+    saveStatus.classList.remove('error', 'ok');
     saveStatus.textContent = 'extracting…';
     $('rescue').hidden = true;
     try {
@@ -311,18 +358,28 @@
       saveStatus.textContent = a.duplicate ? 'already in your library'
         : a.evicted_title ? `saved “${a.title}” · removed oldest article “${a.evicted_title}”`
           : `saved “${a.title}”`;
+      // an article already in the library has nothing to announce
+      if (!a.duplicate) celebrateSave(a.id);
       if (a.challenge) {
         offerRescue({
           url: a.url, articleId: a.id, challenge: a.challenge, mount: $('rescue'),
           head: 'partial extraction. archive.today may hold a fuller snapshot.',
-          onDone: saved => { saveStatus.textContent = `re-extracted “${saved.title}”`; refresh(); },
+          onDone: saved => {
+            saveStatus.textContent = `re-extracted “${saved.title}”`;
+            celebrateSave(saved.id);
+            refresh();
+          },
         });
       }
       if (DEMO && !a.duplicate && !localStorage.getItem('p.demo.selfhost-nudge')) {
         $('demo-nudge').hidden = false;
         localStorage.setItem('p.demo.selfhost-nudge', '1');
       }
-      setTimeout(() => { if (!saveStatus.classList.contains('error')) saveStatus.textContent = ''; }, 4000);
+      setTimeout(() => {
+        if (saveStatus.classList.contains('error')) return;
+        saveStatus.textContent = '';
+        saveStatus.classList.remove('ok');
+      }, 4000);
       refresh();
       // tags arrive async from enrichment; refresh once more
       if (!DEMO) setTimeout(refresh, 9000);
@@ -332,6 +389,7 @@
       } else {
         saveStatus.textContent = e.message;
       }
+      saveStatus.classList.remove('ok');
       saveStatus.classList.add('error');
       // 428 means a snapshot is known and blocked, so go straight at it. Any other
       // failed extraction just gets the offer; the snapshot may not exist.
@@ -342,6 +400,7 @@
         const onDone = saved => {
           saveStatus.classList.remove('error');
           saveStatus.textContent = `saved “${saved.title}” from archive.today`;
+          celebrateSave(saved.id);
           refresh();
         };
         if (e.data?.challenge) {
@@ -987,6 +1046,7 @@
     blocks: [],
     index: 0,
     playing: false,
+    done: false,
     decks: null,
     deck: 0,
     saveTimer: null,
@@ -1023,8 +1083,25 @@
   const current = () => decks()[player.deck];
   const idle = () => decks()[1 - player.deck];
 
-  const segmentUrl = seq => appUrl(`/api/articles/${player.articleId}/narration/${seq}`);
+  /* The revision is part of the URL, not decoration: recasting keeps the same
+     segment numbers, so without it the browser replays the old voice from its
+     own cache. */
+  const segmentUrl = seq =>
+    appUrl(`/api/articles/${player.articleId}/narration/${seq}?v=${encodeURIComponent(player.manifest?.rev || '0')}`);
   const audible = segment => Boolean(segment) && (player.captions || segment.kind !== 'caption');
+
+  /* Empty both decks. Anything they still hold belongs to the casting that was
+     just replaced, and playSegment would happily reuse it. */
+  function clearDecks() {
+    if (!player.decks) return;
+    for (const deck of player.decks) {
+      deck.pause();
+      deck.removeAttribute('src');
+      delete deck.dataset.seq;
+      deck.load();
+    }
+    player.deck = 0;
+  }
 
   function unlockAudio() {
     for (const deck of decks()) {
@@ -1047,19 +1124,33 @@
   async function startNarration({ voiceId, force } = {}) {
     const article = state.current;
     if (!article) return;
+    const recasting = Boolean(force || voiceId) && Boolean(player.manifest);
+    // where the voice being replaced had got to; the server's copy of the
+    // position is half a second behind at best, so carry it across in hand
+    const at = recasting ? elapsed() : 0;
+    const from = recasting ? player.index : 0;
     player.articleId = article.id;
     showPlayer();
-    setNow(force ? 'recasting the narration…' : 'reading the article…');
+    // A recast stops the voice it is replacing straight away, inside the click,
+    // so the decks are empty and still unlocked when the new audio arrives.
+    if (recasting) {
+      pause();
+      clearDecks();
+      unlockAudio();
+    }
+    setNow(recasting || force ? 'recasting the narration…' : 'reading the article…');
     setPlayIcon(false);
     try {
       const manifest = await fetchJson(`/api/articles/${article.id}/narration`, {
         method: 'POST',
-        body: { voice_id: voiceId || undefined, force: force || undefined },
+        body: { voice_id: voiceId || undefined, force: force || undefined, from: from || undefined },
       });
       if (player.articleId !== article.id) return;   // reader moved on while we waited
       adoptManifest(manifest);
       const total = timeline().total;
-      const resume = manifest.audio_pos > 2 && manifest.audio_pos < total - 5 ? manifest.audio_pos : 0;
+      const resume = recasting
+        ? Math.max(0, Math.min(at, total - 5))
+        : (manifest.audio_pos > 2 && manifest.audio_pos < total - 5 ? manifest.audio_pos : 0);
       seekTo(resume, { play: true });
     } catch (e) {
       setNow(`narration failed: ${e.message}`, 'error');
@@ -1068,7 +1159,9 @@
   }
 
   function adoptManifest(manifest) {
+    if (player.manifest && player.manifest.rev !== manifest.rev) clearDecks();
     player.manifest = manifest;
+    player.done = false;
     // the server indexed every matching node of this same document, in order
     player.blocks = [...$('a-body').querySelectorAll(BLOCK_SELECTOR)];
     player.index = 0;
@@ -1106,6 +1199,7 @@
       }
     }
     player.playing = false;
+    player.done = false;
     player.manifest = null;
     player.articleId = null;
     player.index = 0;
@@ -1119,6 +1213,8 @@
   // ── transport ────────────────────────────────────────────────────────────
   function play() {
     if (!player.manifest) return;
+    // the last segment has already been heard; play means play it again
+    if (player.done) return seekTo(0, { play: true });
     player.playing = true;
     setPlayIcon(true);
     const deck = current();
@@ -1160,6 +1256,7 @@
     }
 
     player.index = index;
+    player.done = false;
     const deck = current();
     if (deck.dataset.seq !== String(index)) {
       deck.src = segmentUrl(index);
@@ -1214,6 +1311,7 @@
 
   function finish() {
     pause({ persist: false });
+    player.done = true;
     setNow('finished');
     savePosition(0, { now: true });
     clearHighlight();
@@ -1376,13 +1474,16 @@
 
   async function showVoicePicker() {
     const mount = $('pl-voices');
+    if (!mount.hidden) { mount.hidden = true; return; }
     mount.hidden = false;
     mount.textContent = 'loading voices…';
     try {
       const voices = await fetchJson(`/api/narration/voices?lang=${encodeURIComponent(player.manifest?.language || 'en')}`);
       if (!voices.length) { mount.textContent = 'no voice catalogue available'; return; }
+      const cast = player.manifest?.voice?.id;
       mount.innerHTML = voices.slice(0, 40).map(voice => `
-        <button class="pl-voice" data-voice="${esc(voice.id)}" title="${esc(voice.description || '')}">
+        <button class="pl-voice${voice.id === cast ? ' is-cast' : ''}" data-voice="${esc(voice.id)}"
+          aria-pressed="${voice.id === cast ? 'true' : 'false'}" title="${esc(voice.description || '')}">
           <span class="pl-voice-name">${esc(voice.title)}</span>
           <span class="pl-voice-tags">${esc((voice.tags || []).slice(0, 4).join(' · '))}</span>
         </button>`).join('');
@@ -1390,7 +1491,9 @@
         const button = ev.target.closest('[data-voice]');
         if (!button) return;
         mount.hidden = true;
-        startNarration({ voiceId: button.dataset.voice, force: true });
+        // picking the voice already in the chair is not a recast; keep playing
+        if (button.dataset.voice === player.manifest?.voice?.id) return;
+        startNarration({ voiceId: button.dataset.voice });
       };
     } catch (e) {
       mount.textContent = `voices unavailable: ${e.message}`;

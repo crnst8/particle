@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildScript, speakable, splitForSynthesis, detectLanguage, toneProfile,
-  shortlistVoices, segmentStyle, contentHash,
+  shortlistVoices, segmentStyle, contentHash, planNarration,
 } from '../server/narration.js';
+import { narrationRev } from '../server/narrator.js';
 
 const article = (extra = {}) => ({
   id: 1,
@@ -224,4 +225,31 @@ test('the content hash changes when the article does', () => {
   const a = article({ content_html: '<p>One.</p>' });
   assert.equal(contentHash(a), contentHash({ ...a }));
   assert.notEqual(contentHash(a), contentHash({ ...a, content_html: '<p>Two.</p>' }));
+});
+
+test('picking a voice swaps the voice and keeps the direction already written', async () => {
+  const reuse = {
+    voice_id: 'old-voice', voice_name: 'Old Voice', tone: 'essay', speed: 0.94,
+    temperature: 0.81, top_p: 0.7, pronunciations: [{ find: 'Nguyen', say: 'win' }],
+    reason: 'essay tone, warm', source: 'llm',
+  };
+  const { direction, script } = await planNarration(
+    article({ content_html: '<p>One sentence, read aloud.</p>' }),
+    { voiceId: 'new-voice', reuse },
+  );
+
+  assert.equal(direction.voice_id, 'new-voice');
+  assert.equal(direction.source, 'manual');
+  assert.equal(direction.speed, 0.94);
+  assert.equal(direction.reason, 'essay tone, warm');
+  assert.deepEqual(direction.pronunciations, reuse.pronunciations);
+  assert.ok(script.segments.length > 0);
+});
+
+test('a casting revision moves with the voice, the script and the rebuild', () => {
+  const base = { content_hash: 'abc', voice_id: 'one', created_at: '2026-08-27T00:00:00.000Z' };
+  assert.equal(narrationRev(base), narrationRev({ ...base }));
+  assert.notEqual(narrationRev(base), narrationRev({ ...base, voice_id: 'two' }));
+  assert.notEqual(narrationRev(base), narrationRev({ ...base, content_hash: 'def' }));
+  assert.notEqual(narrationRev(base), narrationRev({ ...base, created_at: '2026-08-27T00:00:01.000Z' }));
 });

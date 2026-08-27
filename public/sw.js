@@ -1,6 +1,6 @@
 /* particle service worker — app shell offline + read-offline for visited articles */
-const SHELL = 'particle-shell-v6';
-const RUNTIME = 'particle-runtime-v6';
+const SHELL = 'particle-shell-v7';
+const RUNTIME = 'particle-runtime-v7';
 const BASE = new URL(self.registration.scope).pathname.replace(/\/$/, '');
 const at = path => `${BASE}${path}` || '/';
 // Keep this list to assets that always exist — cache.addAll() rejects as a whole
