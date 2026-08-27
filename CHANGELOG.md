@@ -1,3 +1,7 @@
+## 1.2.1 — 2026-08-27
+
+- feat: reader overhaul & better visual feedback
+
 ## 1.2.0 — 2026-08-24
 
 - **Settings page**: theme, accent, typeface & size defaults, library vis, lists & reset
