@@ -395,6 +395,18 @@ export function pruneNarrationAudio(maxBytes, keepArticleId) {
   return { total: total - freed, freed };
 }
 
+/* The voices this library has heard lately. Casting uses it to stop reaching
+   for the same narrator every time: the catalogue has a handful of voices that
+   fit almost any article, and without this one of them reads everything. */
+export function recentNarrationVoices(limit = 6) {
+  return db.prepare(`
+    SELECT voice_id FROM narrations
+    WHERE voice_id IS NOT NULL
+    ORDER BY COALESCE(played_at, created_at) DESC
+    LIMIT ?
+  `).all(limit).map(row => row.voice_id);
+}
+
 export function narrationCacheBytes() {
   return db.prepare('SELECT COALESCE(SUM(bytes), 0) AS total FROM narration_segments').get().total;
 }

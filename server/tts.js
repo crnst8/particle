@@ -8,6 +8,11 @@ const MODEL = process.env.TTS_MODEL || 's2.1-pro-free';
 const BITRATE = clampChoice(Number(process.env.TTS_BITRATE), [64, 128, 192], 64);
 const LATENCY = ['normal', 'balanced', 'low'].includes(process.env.TTS_LATENCY) ? process.env.TTS_LATENCY : 'normal';
 const PINNED_VOICE = (process.env.TTS_VOICE_ID || '').trim();
+/* Voices to keep out of the catalogue by title substring. The provider's public
+   catalogue includes clones of real people; whether that is acceptable is the
+   operator's call, not particle's, so it is a list rather than a rule. */
+const DENIED = (process.env.TTS_VOICE_DENY || '')
+  .split(',').map(entry => entry.trim().toLowerCase()).filter(Boolean);
 // 1 = always use TTS_VOICE_ID; per-article voice selection is skipped.
 export const VOICE_LOCKED = process.env.TTS_VOICE_LOCK === '1' && Boolean(PINNED_VOICE);
 
@@ -19,6 +24,12 @@ export const pinnedVoiceId = PINNED_VOICE || null;
 const VOICE_TTL_MS = 60 * 60 * 1000;
 const voiceCache = new Map();   // language → { at, voices }
 const voiceById = new Map();    // id → voice (whatever we have already seen)
+const refreshing = new Map();   // language → Promise, so one refresh serves everyone
+
+/* The catalogue's own ordering is by task count, which puts meme and game
+   voices first and buries the ones that read prose. Asking for each register
+   separately is what puts real narrators in the pool at all. */
+const CATALOGUE_TAGS = ['narration', 'storytelling', 'audiobook', 'documentary', 'educational'];
 
 /**
  * One synthesis call. Returns the mp3 bytes plus the duration implied by the
@@ -109,23 +120,51 @@ export async function listVoices(language = 'en') {
   const cached = voiceCache.get(language);
   if (cached && Date.now() - cached.at < VOICE_TTL_MS) return cached.voices;
   if (!KEY) return [];
-
-  try {
-    const pages = await Promise.all([
-      fetchVoices({ language, tag: 'narration' }),
-      fetchVoices({ language }),
-    ]);
-    const seen = new Map();
-    for (const voice of pages.flat()) if (!seen.has(voice.id)) seen.set(voice.id, voice);
-    const voices = [...seen.values()].filter(usableForProse);
-    for (const voice of voices) voiceById.set(voice.id, voice);
-    voiceCache.set(language, { at: Date.now(), voices });
-    return voices;
-  } catch (error) {
-    console.error('tts: voice catalogue unavailable:', error.message);
-    voiceCache.set(language, { at: Date.now(), voices: cached?.voices || [] });
-    return cached?.voices || [];
+  // A stale list is a better answer than a held-open request: casting can start
+  // now and the refresh lands in time for the next article.
+  if (cached?.voices.length) {
+    refreshVoices(language).catch(() => {});
+    return cached.voices;
   }
+  return refreshVoices(language);
+}
+
+/** Fill the catalogue before anyone asks, so the first article never waits on it. */
+export function prewarmVoices(language = 'en') {
+  if (!KEY) return Promise.resolve([]);
+  return refreshVoices(language).catch(() => []);
+}
+
+function refreshVoices(language) {
+  const running = refreshing.get(language);
+  if (running) return running;
+
+  const job = (async () => {
+    try {
+      const pages = await Promise.all([
+        ...CATALOGUE_TAGS.map(tag => fetchVoices({ language, tag })),
+        fetchVoices({ language }),
+      ]);
+      const seen = new Map();
+      for (const voice of pages.flat()) if (!seen.has(voice.id)) seen.set(voice.id, voice);
+      const voices = [...seen.values()].filter(usableForProse);
+      for (const voice of voices) voiceById.set(voice.id, voice);
+      voiceCache.set(language, { at: Date.now(), voices });
+      return voices;
+    } catch (error) {
+      console.error('tts: voice catalogue unavailable:', error.message);
+      const stale = voiceCache.get(language)?.voices || [];
+      // Hold the stale list rather than the failure, but let it expire soon so
+      // the next call tries again instead of waiting out a full hour.
+      voiceCache.set(language, { at: Date.now() - VOICE_TTL_MS + 60_000, voices: stale });
+      return stale;
+    } finally {
+      refreshing.delete(language);
+    }
+  })();
+
+  refreshing.set(language, job);
+  return job;
 }
 
 export function knownVoice(id) {
@@ -168,9 +207,15 @@ const UNSUITABLE = new Set([
   'vocaloid', 'virtual idol', 'sexy', 'intense', 'monotone', 'digital', 'sci-fi',
 ]);
 
+// Uploaders sometimes label the problem in the title. Believe them.
+const UNSUITABLE_TITLE = /\b(don'?t use|do not use|copyright(ed)?|test(ing)?( ?voice)?|placeholder|sfx|sound ?effect)\b/i;
+
 function usableForProse(voice) {
   if (voice.state !== 'trained' || voice.visibility !== 'public' || voice.takenDown) return false;
-  if (!voice.title) return false;
+  if (!voice.title || UNSUITABLE_TITLE.test(voice.title)) return false;
+  if (DENIED.length && DENIED.some(term => voice.title.toLowerCase().includes(term))) return false;
+  // A voice with no tags at all cannot be cast on fit, only on luck.
+  if (!voice.tags.length) return false;
   return !voice.tags.some(tag => UNSUITABLE.has(tag));
 }
 

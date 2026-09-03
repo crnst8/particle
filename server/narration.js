@@ -344,36 +344,44 @@ export const readingMinutes = article => Math.max(1, Math.round((article.word_co
 // ── voice ────────────────────────────────────────────────────────────────────
 
 /* What a piece asks for out loud. A market report and a personal essay want
-   different narrators, and the tags the library already stores say which. */
+   different narrators, and the tags the library already stores say which.
+   `clash` is the register that would be wrong for this kind of writing — an
+   advertising read on a war report — and costs a voice more than a missing
+   `want` tag saves it. */
 const TONE_PROFILES = [
   {
     id: 'reportage',
     test: /\b(news|politic|policy|election|business|econom|finance|market|war|court|law|crime|investigat)/i,
-    want: ['clear', 'professional', 'authoritative', 'crisp', 'measured', 'confident', 'serious', 'narration'],
+    want: ['clear', 'professional', 'authoritative', 'crisp', 'measured', 'confident', 'serious', 'neutral-tone'],
+    clash: ['warm', 'gentle', 'intimate', 'soft', 'breathy', 'dramatic', 'mysterious'],
     speed: 1.03, temperature: 0.6,
   },
   {
     id: 'essay',
     test: /\b(essay|opinion|culture|book|literat|history|philosoph|art|film|movie|music|memoir|review|poet)/i,
-    want: ['warm', 'measured', 'storytelling', 'narration', 'calm', 'expressive', 'smooth', 'narrative'],
+    want: ['warm', 'measured', 'storytelling', 'calm', 'expressive', 'smooth', 'narrative', 'gentle'],
+    clash: ['crisp', 'authoritative', 'fast', 'confident'],
     speed: 0.97, temperature: 0.78,
   },
   {
     id: 'technical',
     test: /\b(tech|ai|software|programming|engineer|science|research|data|security|physics|biolog|math)/i,
-    want: ['clear', 'professional', 'educational', 'neutral-tone', 'crisp', 'calm', 'articulate'],
+    want: ['clear', 'professional', 'educational', 'neutral-tone', 'calm', 'measured', 'teacher', 'articulate'],
+    clash: ['dramatic', 'expressive', 'breathy', 'raspy', 'cinematic', 'mysterious'],
     speed: 1.0, temperature: 0.58,
   },
   {
     id: 'feature',
     test: /\b(profile|interview|travel|food|sport|health|life|design|fashion|game|feature)/i,
-    want: ['conversational', 'friendly', 'warm', 'expressive', 'narration', 'bright', 'host'],
+    want: ['conversational', 'friendly', 'warm', 'expressive', 'bright', 'host', 'smooth', 'sincere'],
+    clash: ['serious', 'authoritative', 'deep', 'low', 'slow'],
     speed: 1.0, temperature: 0.74,
   },
 ];
 const DEFAULT_PROFILE = {
   id: 'general',
-  want: ['narration', 'clear', 'calm', 'measured', 'storytelling', 'professional'],
+  want: ['clear', 'calm', 'measured', 'storytelling', 'professional', 'smooth'],
+  clash: ['dramatic', 'breathy', 'raspy'],
   speed: 1.0, temperature: 0.7,
 };
 
@@ -385,21 +393,80 @@ export function toneProfile(article) {
   return (article.word_count || 0) > 2500 ? { ...profile, speed: profile.speed - 0.03 } : profile;
 }
 
-/** Rank the catalogue for this article: tag fit first, then a nod to popularity. */
-export function shortlistVoices(article, voices, profile = toneProfile(article)) {
+/* Whether a voice reads prose at all, kept apart from which prose suits it —
+   every profile wants a reader, and none of them wants a brand ambassador. */
+const READS_PROSE = new Set([
+  'narration', 'storytelling', 'narrative', 'audiobook', 'documentary', 'educational', 'teacher', 'host',
+]);
+const OFF_REGISTER = new Set([
+  'social-media', 'advertisement', 'entertainment', 'influencer', 'motivational', 'fitness',
+  'energetic', 'enthusiastic', 'playful', 'animated', 'cheerful', 'fast', 'dynamic', 'high',
+]);
+
+/**
+ * Rank the catalogue for this article.
+ *
+ * The old scoring counted matching tags, which quietly meant "whoever wrote the
+ * longest tag list wins" — one voice tagged fourteen ways matched every profile
+ * and read every article in the library. Fit is now the harmonic mean of how
+ * much of the wanted register the voice covers and how much of the voice that
+ * register actually is, so breadth stops being an advantage. Popularity is
+ * capped low enough to only break ties, and the per-article jitter is wide
+ * enough to genuinely reshuffle candidates that fit equally well.
+ *
+ * `avoid` is the handful of voices the library has heard most recently: still
+ * castable, just no longer the obvious answer.
+ */
+export function shortlistVoices(article, voices, profile = toneProfile(article), { avoid = [] } = {}) {
   const seed = hashNumber(`${article.id}:${article.url || ''}`);
   const wanted = new Set(profile.want);
-  return voices
-    .map((voice, index) => {
-      const hits = voice.tags.filter(tag => wanted.has(tag)).length;
-      const narration = voice.tags.includes('narration') || voice.tags.includes('storytelling') ? 1.5 : 0;
-      const popularity = Math.log10(1 + voice.popularity) / 8;
-      // a stable per-article jitter so two articles do not always draw the same voice
-      const jitter = (((seed + index * 2654435761) >>> 0) % 1000) / 4000;
-      return { voice, score: hits * 1.4 + narration + popularity + jitter };
-    })
-    .sort((a, b) => b.score - a.score)
-    .map(entry => entry.voice);
+  const clashing = new Set(profile.clash || []);
+  const recent = new Set(avoid);
+
+  const scored = voices.map(voice => ({ voice, score: scoreVoice(voice, { wanted, clashing, recent, seed }) }));
+
+  /* The catalogue carries the same voice several times over under one name,
+     re-uploaded by different people. Ranking them separately fills the whole
+     shortlist — and the picker — with one narrator wearing six hats. */
+  const best = new Map();
+  for (const entry of scored) {
+    const key = voiceKey(entry.voice);
+    if (!best.has(key) || best.get(key).score < entry.score) best.set(key, entry);
+  }
+
+  return [...best.values()].sort((a, b) => b.score - a.score).map(entry => entry.voice);
+}
+
+function scoreVoice(voice, { wanted, clashing, recent, seed }) {
+  const tags = voice.tags || [];
+  const matched = tags.filter(tag => wanted.has(tag)).length;
+  const coverage = wanted.size ? matched / wanted.size : 0;
+  const focus = tags.length ? matched / tags.length : 0;
+  // F1: covering the brief and being nothing else both have to be true
+  const fit = coverage && focus ? (2 * coverage * focus) / (coverage + focus) : 0;
+
+  const prose = Math.min(2, tags.filter(tag => READS_PROSE.has(tag)).length) * 0.35;
+  const off = Math.min(3, tags.filter(tag => OFF_REGISTER.has(tag)).length) * -0.3;
+  const clash = Math.min(3, tags.filter(tag => clashing.has(tag)).length) * -0.2;
+  // enough to settle a tie, never enough to win one
+  const popularity = Math.min(0.15, Math.log10(1 + (voice.popularity || 0)) / 50);
+  // stable per article and per voice, so the catalogue growing does not reshuffle
+  const jitter = (hashNumber(`${seed}:${voice.id}`) % 1000) / 1667;
+  const familiar = recent.has(voice.id) ? -1.1 : 0;
+
+  return fit * 3 + prose + off + clash + popularity + jitter + familiar;
+}
+
+const voiceKey = voice => String(voice.title || voice.id).toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+/* What the panel says about the casting when no model wrote a reason. The
+   voice's own labels are the honest answer: they are what it was picked on. */
+export function castingReason(voice, profile) {
+  if (!voice) return `${profile.id} tone, chosen from the article's subject and length`;
+  const wanted = new Set(profile.want);
+  const qualities = (voice.tags || []).filter(tag => wanted.has(tag) || READS_PROSE.has(tag)).slice(0, 3);
+  if (!qualities.length) return `${profile.id} tone, chosen from the article's subject and length`;
+  return `${qualities.join(', ')} — cast for a ${profile.id} piece`;
 }
 
 export function detectLanguage(text = '') {
@@ -427,23 +494,32 @@ export function detectLanguage(text = '') {
  * words belong to the article, not to whoever reads it — so the direction is
  * carried over and no model is asked again. That is what makes a swap quick.
  */
-export async function planNarration(article, { voiceId, reuse } = {}) {
+export async function planNarration(article, { voiceId, reuse, avoid = [], onStage = () => {} } = {}) {
   const language = detectLanguage(article.text_content || '');
   const profile = toneProfile(article);
 
   if (voiceId && reuse && !VOICE_LOCKED) {
+    onStage('casting', { detail: 'keeping the direction, swapping the voice' });
+    // The pacing and the awkward words belong to the article and carry over.
+    // The reason does not: it described the voice that was just replaced.
+    const chosen = knownVoice(voiceId);
     const direction = {
       ...reuse,
       voice_id: voiceId,
       voice_name: await voiceTitle(voiceId, language),
       source: 'manual',
-      reason: reuse.reason || `${profile.id} tone, chosen from the article's subject and length`,
+      reason: chosen ? `${castingReason(chosen, profile)}, chosen by hand` : 'chosen by hand',
     };
+    onStage('script', { detail: 'rebuilding the script' });
     return { direction, script: buildScript(article, direction), language, contentHash: contentHash(article) };
   }
 
+  onStage('catalogue', { detail: 'looking over the voice catalogue' });
   const voices = VOICE_LOCKED ? [] : await listVoices(language);
-  const ranked = shortlistVoices(article, voices, profile);
+  const ranked = shortlistVoices(article, voices, profile, { avoid });
+  onStage('casting', {
+    detail: `${ranked.length} voice${ranked.length === 1 ? '' : 's'} ranked for a ${profile.id} piece`,
+  });
 
   const direction = {
     voice_id: pinnedVoiceId || ranked[0]?.id || null,
@@ -453,11 +529,12 @@ export async function planNarration(article, { voiceId, reuse } = {}) {
     temperature: profile.temperature,
     top_p: 0.7,
     pronunciations: [],
-    reason: `${profile.id} tone, chosen from the article's subject and length`,
+    reason: castingReason(ranked[0], profile),
     source: 'heuristic',
   };
 
   if (isLlmConfigured && !VOICE_LOCKED) {
+    onStage('directing', { detail: 'reading the article to cast it' });
     try {
       applySuggestion(direction, await directNarration({
         article,
@@ -473,6 +550,7 @@ export async function planNarration(article, { voiceId, reuse } = {}) {
       }), ranked);
     } catch (error) {
       console.error(`narration direction for #${article.id} failed:`, error.message);
+      onStage('directing', { detail: 'the model did not answer — casting on the article\'s own tags' });
     }
   }
 
@@ -488,6 +566,7 @@ export async function planNarration(article, { voiceId, reuse } = {}) {
     direction.source = 'pinned';
   }
 
+  onStage('script', { detail: 'writing the script' });
   return { direction, script: buildScript(article, direction), language, contentHash: contentHash(article) };
 }
 

@@ -115,7 +115,10 @@ Decide:
 Reply with JSON only:
 {"voice_id":"...","tone":"...","speed":1.0,"temperature":0.7,"intro":"...","pronunciations":[{"find":"...","say":"..."}],"reason":"..."}`,
     },
-  ], { maxTokens: 1500 });
+    // A reasoning model spends most of its budget before the first character of
+    // JSON appears. Under-budget it and every casting silently falls back to the
+    // heuristic, which is what made one voice read the whole library.
+  ], { maxTokens: 2500 });
 
   const parsed = parseJsonLoose(reply);
   return {

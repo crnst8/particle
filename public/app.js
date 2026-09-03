@@ -1053,6 +1053,10 @@
     ticker: null,
     lit: [],
     lastScrollAt: 0,
+    status: null,      // EventSource: what the server is doing, as it does it
+    stage: null,       // the last thing it said, and when
+    stageTimer: null,
+    turn: 0,           // which playSegment call owns the decks right now
     get rate() { return Number(localStorage.getItem('p.rate')) || 1; },
     set rate(v) { localStorage.setItem('p.rate', String(v)); },
     get follow() { return localStorage.getItem('p.follow') !== '0'; },
@@ -1074,6 +1078,12 @@
         deck.hidden = true;
         player.el.appendChild(deck);
         deck.addEventListener('ended', () => { if (deck === current()) afterSegment(); });
+        // a stalled segment that starts is no longer news; the passage is
+        deck.addEventListener('playing', () => {
+          if (deck !== current() || !player.stage) return;
+          clearStage();
+          setNow(nowLabel(player.manifest?.segments?.[player.index]));
+        });
         deck.addEventListener('loadedmetadata', () => reconcileDuration(deck));
         deck.addEventListener('error', () => { if (deck === current() && deck.dataset.seq) segmentFailed(); });
       }
@@ -1082,6 +1092,15 @@
   }
   const current = () => decks()[player.deck];
   const idle = () => decks()[1 - player.deck];
+
+  /* One voice, always. `play()` is a promise, and a deck told to play before it
+     was abandoned still starts when that promise settles — which is how two
+     paragraphs end up reading over each other after a phone wakes up and
+     delivers a queue of media events at once. */
+  function silenceOthers(keep) {
+    if (!player.decks) return;
+    for (const deck of player.decks) if (deck !== keep) deck.pause();
+  }
 
   /* The revision is part of the URL, not decoration: recasting keeps the same
      segment numbers, so without it the browser replays the old voice from its
@@ -1138,7 +1157,10 @@
       clearDecks();
       unlockAudio();
     }
-    setNow(recasting || force ? 'recasting the narration…' : 'reading the article…');
+    // opened before the request, so the first thing the reader sees is what the
+    // server is doing rather than a label this file made up
+    watchStatus(article.id);
+    setStage(recasting || force ? 'recasting the narration' : 'planning the narration');
     setPlayIcon(false);
     try {
       const manifest = await fetchJson(`/api/articles/${article.id}/narration`, {
@@ -1153,9 +1175,69 @@
         : (manifest.audio_pos > 2 && manifest.audio_pos < total - 5 ? manifest.audio_pos : 0);
       seekTo(resume, { play: true });
     } catch (e) {
+      clearStage();
       setNow(`narration failed: ${e.message}`, 'error');
       setPlayIcon(false);
     }
+  }
+
+  /* ── live state ──────────────────────────────────────────────────────────
+     Casting can mean a catalogue lookup and a model call; a paragraph of audio
+     is a synthesis request that takes as long as it takes. Both used to look
+     identical from here — one motionless label — so the server streams what it
+     is actually on, and this shows it, counting the seconds once a step runs
+     long enough that a reader would start to wonder. */
+  function watchStatus(articleId) {
+    closeStatus();
+    if (DEMO || typeof EventSource === 'undefined') return;
+    try {
+      const stream = new EventSource(appUrl(`/api/articles/${articleId}/narration/status`));
+      stream.onmessage = (event) => {
+        if (player.articleId !== articleId) return;
+        try { onStatus(JSON.parse(event.data)); } catch { /* a frame we cannot read is not worth a stack */ }
+      };
+      // the stream is a nicety; the player works without it
+      stream.onerror = () => {};
+      player.status = stream;
+    } catch { /* no stream, no live state — the fallback labels still show */ }
+  }
+
+  function closeStatus() {
+    if (player.status) player.status.close();
+    player.status = null;
+  }
+
+  function onStatus(event) {
+    // warm-ahead work is not what anyone is waiting for
+    if (event.background) return;
+    if (event.stage === 'error') { clearStage(); return setNow(event.detail, 'error'); }
+    // once a voice is actually speaking, the label belongs to the passage
+    if (player.playing && !(event.seq === player.index && event.stage !== 'ready')) return;
+    if (event.stage === 'ready') { clearStage(); return; }
+    setStage(event.detail, event);
+  }
+
+  /* The elapsed count is the honest part: it is the difference between "still
+     working" and "stopped", and nothing else on screen can say which. */
+  function setStage(detail, event = {}) {
+    player.stage = { detail, at: Date.now(), ...event };
+    renderStage();
+    clearInterval(player.stageTimer);
+    player.stageTimer = setInterval(renderStage, 1000);
+  }
+
+  function clearStage() {
+    clearInterval(player.stageTimer);
+    player.stageTimer = null;
+    player.stage = null;
+  }
+
+  function renderStage() {
+    if (!player.stage) return;
+    const { detail, at, seq, total } = player.stage;
+    const seconds = Math.floor((Date.now() - at) / 1000);
+    const where = Number.isInteger(seq) && total ? ` (${seq + 1}/${total})` : '';
+    setNow(`${detail}${where}${seconds >= 3 ? ` · ${seconds}s` : ''}…`);
   }
 
   function adoptManifest(manifest) {
@@ -1177,6 +1259,8 @@
 
   function stopNarration() {
     pause();
+    closeStatus();
+    clearStage();
     clearHighlight();
     player.el.hidden = true;
     $('pl-panel').hidden = true;
@@ -1189,6 +1273,8 @@
      so reopening picks the narration back up where it stopped. */
   function resetNarration() {
     if (player.manifest) savePosition(elapsed(), { now: true });
+    closeStatus();
+    clearStage();
     clearInterval(player.ticker);
     player.ticker = null;
     if (player.decks) {
@@ -1219,8 +1305,9 @@
     setPlayIcon(true);
     const deck = current();
     if (deck.dataset.seq === String(player.index) && deck.src) {
+      const turn = ++player.turn;
       deck.playbackRate = player.rate;
-      deck.play().catch(() => {});
+      deck.play().then(() => { if (turn === player.turn) silenceOthers(deck); }).catch(() => {});
       startTicker();
       preloadNext();
       updateMediaSession();
@@ -1249,6 +1336,8 @@
     if (index >= segments.length) return finish();
     if (!audible(segments[index])) return playSegment(index + 1, 0);
 
+    // Anything already starting is no longer what the reader asked for.
+    const turn = ++player.turn;
     for (const deck of decks()) deck.pause();
     // the spare deck may already hold this segment from the prefetch
     if (idle().dataset.seq === String(index) && current().dataset.seq !== String(index)) {
@@ -1266,9 +1355,13 @@
     setTime(deck, offset);
 
     highlight(index);
+    clearStage();
     setNow(nowLabel(segments[index]));
     if (player.playing) {
       try { await deck.play(); } catch { /* refused until a gesture; the button still works */ }
+      // a passage that was overtaken while it was starting stops here
+      if (turn !== player.turn) return deck.pause();
+      silenceOthers(deck);
       startTicker();
     }
     preloadNext();
@@ -1303,6 +1396,38 @@
     spare.dataset.seq = String(next);
     spare.load();
   }
+
+  /* iOS suspends the page along with the screen. A segment that ends in there
+     often cannot start the next one — the audio session is gone by the time
+     anything runs, and nothing but a gesture brings it back — so the player
+     says it is playing while the phone is silent, until the app is restarted.
+     The first moment the page is in front of someone again is the moment to
+     put it right: carry on where it stopped, or say plainly that it needs a
+     press. */
+  function resumeAfterWake() {
+    const deck = current();
+    if (deck.ended) return afterSegment();                       // it finished in the dark
+    if (deck.dataset.seq !== String(player.index)) return playSegment(player.index, 0);
+    const turn = ++player.turn;
+    deck.playbackRate = player.rate;
+    deck.play()
+      .then(() => {
+        if (turn !== player.turn) return deck.pause();
+        silenceOthers(deck);
+        startTicker();
+      })
+      .catch(() => {
+        pause({ persist: false });
+        setNow('the screen went off — press play to pick it back up', 'error');
+      });
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !player.manifest || !player.playing) return;
+    // still going: the phone was locked but the audio session survived
+    if (decks().some(deck => !deck.paused && !deck.ended)) return;
+    resumeAfterWake();
+  });
 
   function segmentFailed() {
     setNow('that passage would not synthesise — skipping it', 'error');
@@ -1472,16 +1597,30 @@
     panel.querySelector('#pl-pick').addEventListener('click', showVoicePicker);
   }
 
+  /* The catalogue is a network round trip through the provider, and reopening
+     the picker to compare two voices should not pay for it twice. It is keyed
+     by article because the order is this article's ranking, not a fixed list. */
+  const voiceCache = new Map();
+
   async function showVoicePicker() {
     const mount = $('pl-voices');
     if (!mount.hidden) { mount.hidden = true; return; }
     mount.hidden = false;
-    mount.textContent = 'loading voices…';
+    const language = player.manifest?.language || 'en';
+    const key = `${player.articleId}:${language}`;
+    mount.textContent = voiceCache.has(key) ? '' : 'loading voices…';
     try {
-      const voices = await fetchJson(`/api/narration/voices?lang=${encodeURIComponent(player.manifest?.language || 'en')}`);
+      if (!voiceCache.has(key)) {
+        voiceCache.set(key, await fetchJson(
+          `/api/narration/voices?lang=${encodeURIComponent(language)}&for=${encodeURIComponent(player.articleId)}`));
+      }
+      const voices = voiceCache.get(key);
       if (!voices.length) { mount.textContent = 'no voice catalogue available'; return; }
       const cast = player.manifest?.voice?.id;
-      mount.innerHTML = voices.slice(0, 40).map(voice => `
+      const suited = voices.filter(voice => voice.suits).length;
+      mount.innerHTML = voices.slice(0, 40).map((voice, index) => `
+        ${suited && index === 0 ? '<p class="pl-voice-head">suits this article</p>' : ''}
+        ${suited && index === suited ? '<p class="pl-voice-head">the rest of the catalogue</p>' : ''}
         <button class="pl-voice${voice.id === cast ? ' is-cast' : ''}" data-voice="${esc(voice.id)}"
           aria-pressed="${voice.id === cast ? 'true' : 'false'}" title="${esc(voice.description || '')}">
           <span class="pl-voice-name">${esc(voice.title)}</span>
@@ -1496,6 +1635,7 @@
         startNarration({ voiceId: button.dataset.voice });
       };
     } catch (e) {
+      voiceCache.delete(key);
       mount.textContent = `voices unavailable: ${e.message}`;
     }
   }

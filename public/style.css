@@ -755,6 +755,16 @@ input { font: inherit; color: inherit; }
 .pl-voice.is-cast .pl-voice-name::after { content: ' · reading'; color: var(--ink-3); }
 .pl-voice-name { color: var(--ink); font-size: .78rem; }
 .pl-voice-tags { color: var(--ink-3); font-size: .68rem; }
+/* the shortlist and the rest of the catalogue are two lists, not one long one */
+.pl-voice-head {
+  grid-column: 1 / -1;
+  margin: .3rem 0 0;
+  color: var(--ink-3);
+  font-size: .66rem;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.pl-voice-head:first-child { margin-top: 0; }
 
 @media (max-width: 32rem) {
   .pl-skip { display: none; }

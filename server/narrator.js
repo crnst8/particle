@@ -6,7 +6,10 @@ import { createHash } from 'node:crypto';
 import { synthesize, isTtsConfigured, audioFormat, audioMime } from './tts.js';
 import { planNarration, contentHash, segmentStyle } from './narration.js';
 
-const CONCURRENCY = positiveInt(process.env.TTS_CONCURRENCY, 2);
+/* Two slots meant the segment in front of the reader shared the provider with
+   one paragraph of prefetch and waited behind the rest. Four keeps the warm
+   queue moving without a provider ever seeing a burst it will rate-limit. */
+const CONCURRENCY = positiveInt(process.env.TTS_CONCURRENCY, 4);
 const MAX_CACHE_BYTES = positiveInt(process.env.TTS_MAX_CACHE_MB, 512) * 1024 * 1024;
 const WARM_AHEAD = positiveInt(process.env.TTS_WARM_AHEAD, 3);
 
@@ -15,6 +18,40 @@ export function createNarrator(store) {
   const planning = new Map();   // "articleId:voiceId" → Promise<narration>
   let running = 0;
   const queue = [];
+
+  // ── what the reader is waiting for ─────────────────────────────────────────
+  /* Casting and synthesis both take real seconds, and a spinner that says
+     nothing is indistinguishable from one that is stuck. Every step reports
+     what it is actually doing, to whoever is watching this article. */
+  const watchers = new Map();   // articleId → Set<send>
+  const latest = new Map();     // articleId → last event, for a watcher arriving mid-flight
+  /* Warm-ahead work runs quietly until the player catches up with it, which it
+     does by asking for a segment already in flight. From that moment it is what
+     the reader is waiting on, so it starts saying so. */
+  const wanted = new Set();     // in-flight keys some foreground request has joined
+  const progress = new Map();   // in-flight key → its last report, to replay on promotion
+
+  function emit(articleId, stage, fields = {}) {
+    const event = { stage, at: Date.now(), ...fields };
+    latest.set(articleId, event);
+    for (const send of watchers.get(articleId) || []) {
+      try { send(event); } catch { /* a closed stream is not this job's problem */ }
+    }
+    return event;
+  }
+
+  function watch(articleId, send) {
+    if (!watchers.has(articleId)) watchers.set(articleId, new Set());
+    watchers.get(articleId).add(send);
+    const last = latest.get(articleId);
+    if (last) send(last);
+    return () => {
+      const set = watchers.get(articleId);
+      if (!set) return;
+      set.delete(send);
+      if (!set.size) watchers.delete(articleId);
+    };
+  }
 
   /** Plan or reuse a narration. Rebuilds when the article, or the chosen voice, changed. */
   async function ensure(article, { force = false, voiceId = null } = {}) {
@@ -31,10 +68,17 @@ export function createNarrator(store) {
     const planKey = `${article.id}:${voiceId || ''}:${force ? 'force' : ''}`;
     if (planning.has(planKey)) return planning.get(planKey);
     const job = (async () => {
-      const { direction, script, language, contentHash: hash } = await planNarration(article, { voiceId, reuse });
+      emit(article.id, 'planning', { detail: voiceId ? 'switching voice' : 'planning the narration' });
+      const { direction, script, language, contentHash: hash } = await planNarration(article, {
+        voiceId,
+        reuse,
+        // the voice that reads every article is the one that read the last few
+        avoid: voiceId ? [] : recentVoices(article.id),
+        onStage: (stage, fields) => emit(article.id, stage, fields),
+      });
       // A new script means the old audio no longer lines up with it.
       store.deleteNarration(article.id);
-      return store.saveNarration(article.id, {
+      const saved = store.saveNarration(article.id, {
         content_hash: hash,
         language,
         voice_id: direction.voice_id,
@@ -46,14 +90,42 @@ export function createNarrator(store) {
         script,
         format: audioFormat,
       });
-    })().finally(() => planning.delete(planKey));
+      emit(article.id, 'cast', {
+        detail: `${direction.voice_name} will read it`,
+        voice: direction.voice_name,
+        reason: direction.reason,
+        source: direction.source,
+        total: script.segments?.length || 0,
+      });
+      return saved;
+    })().catch((error) => {
+      emit(article.id, 'error', { detail: error.message });
+      throw error;
+    }).finally(() => planning.delete(planKey));
 
     planning.set(planKey, job);
     return job;
   }
 
-  /** The audio for one segment, from cache or from the provider. */
-  async function segment(article, narration, seq) {
+  /* The narrations played most recently, minus this one — recasting an article
+     should not treat the voice it is replacing as fresh. */
+  function recentVoices(articleId) {
+    if (typeof store.recentNarrationVoices !== 'function') return [];
+    try {
+      return store.recentNarrationVoices(8).filter(id => id && id !== store.getNarration(articleId)?.voice_id);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The audio for one segment, from cache or from the provider.
+   *
+   * `background` marks warm-ahead work. It goes to the back of the queue and
+   * reports quietly, so a segment the player is actually waiting on is never
+   * stuck behind three paragraphs nobody has reached yet.
+   */
+  async function segment(article, narration, seq, { background = false } = {}) {
     const cached = store.getNarrationSegment(article.id, seq);
     if (cached) return { audio: Buffer.from(cached.audio), duration: cached.duration, cached: true };
 
@@ -61,13 +133,35 @@ export function createNarrator(store) {
     // answered by synthesis still running for the voice it replaced.
     const rev = narrationRev(narration);
     const key = `${article.id}:${rev}:${seq}`;
-    if (inFlight.has(key)) return inFlight.get(key);
+    if (!background) wanted.add(key);
+
+    const running = inFlight.get(key);
+    if (running) {
+      // Joining work already under way: say where it has got to, or the reader
+      // watches four silent seconds with nothing on screen to explain them.
+      const last = !background && progress.get(key);
+      if (last) emit(article.id, last.stage, { ...last.fields, background: false });
+      return running;
+    }
 
     const spec = narration.script.segments?.[seq];
     if (!spec) throw Object.assign(new Error('no such narration segment'), { statusCode: 404 });
 
+    const total = narration.script.segments.length;
+    // read at emit time, not now: a background job the player has since caught
+    // up with is foreground work by the time it reports
+    const quiet = () => background && !wanted.has(key);
+    const report = (stage, fields) => {
+      progress.set(key, { stage, fields: { seq, total, ...fields } });
+      if (quiet() && stage !== 'ready') return;
+      emit(article.id, stage, { seq, total, background: quiet(), ...fields });
+    };
+    report('queued', { detail: 'waiting for a synthesis slot' });
+
     const job = withSlot(async () => {
+      report('synthesising', { detail: `reading ${describe(spec)}` });
       const style = segmentStyle(spec.kind, narration.direction);
+      const started = Date.now();
       const { audio, duration } = await synthesize({
         text: spec.text,
         voiceId: narration.voice_id,
@@ -86,8 +180,16 @@ export function createNarrator(store) {
       }
       store.saveNarrationSegment(article.id, seq, audio, duration);
       store.pruneNarrationAudio(MAX_CACHE_BYTES, article.id);
+      report('ready', {
+        detail: `${describe(spec)} ready`,
+        ms: Date.now() - started,
+        ready: store.narrationSegmentIndex(article.id).length,
+      });
       return { audio, duration, cached: false };
-    }).finally(() => inFlight.delete(key));
+    }, { background }).catch((error) => {
+      report('error', { detail: error.message });
+      throw error;
+    }).finally(() => { inFlight.delete(key); wanted.delete(key); progress.delete(key); });
 
     inFlight.set(key, job);
     return job;
@@ -100,7 +202,7 @@ export function createNarrator(store) {
     const total = narration.script.segments?.length || 0;
     for (let seq = fromSeq; seq < Math.min(total, fromSeq + count); seq++) {
       if (store.hasNarrationSegment(article.id, seq)) continue;
-      segment(article, narration, seq).catch(() => {});
+      segment(article, narration, seq, { background: true }).catch(() => {});
     }
   }
 
@@ -138,13 +240,18 @@ export function createNarrator(store) {
     };
   }
 
-  function withSlot(run) {
+  /* Warm-ahead work queues behind anything the player is waiting on. Without
+     this a voice switch waits out three paragraphs of the *previous* request's
+     prefetch before the paragraph in front of the reader is even started. */
+  function withSlot(run, { background = false } = {}) {
     if (running < CONCURRENCY) {
       running += 1;
       return run().finally(release);
     }
     return new Promise((resolve, reject) => {
-      queue.push(() => run().then(resolve, reject).finally(release));
+      const job = () => run().then(resolve, reject).finally(release);
+      if (background) queue.push(job);
+      else queue.unshift(job);
     });
   }
 
@@ -158,9 +265,10 @@ export function createNarrator(store) {
   }
 
   return {
-    ensure, segment, warm, manifest,
+    ensure, segment, warm, manifest, watch,
+    status: id => latest.get(id) || null,
     rev: narrationRev,
-    drop: id => store.deleteNarration(id),
+    drop: (id) => { store.deleteNarration(id); latest.delete(id); },
     enabled: isTtsConfigured,
   };
 }
@@ -186,6 +294,21 @@ function estimateDuration(spec, direction) {
   const speed = segmentStyle(spec.kind, direction).speed || 1;
   const rate = (CHARS_PER_SECOND[spec.kind] || 15.5) * speed;
   return Number((spec.chars / rate + (spec.pause || 0) / 1000).toFixed(2));
+}
+
+/* What a segment is, in the words the reader would use for it. The status line
+   says "reading the opening line", not "segment 0"; where it sits in the article
+   is the client's to add, so it is not said twice. */
+function describe(spec) {
+  const named = {
+    intro: 'the opening line',
+    outro: 'the closing line',
+    heading: 'a section heading',
+    quote: 'a quotation',
+    caption: 'a caption',
+    item: 'a list item',
+  }[spec.kind];
+  return named || 'a passage';
 }
 
 function positiveInt(value, fallback) {

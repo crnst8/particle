@@ -9,7 +9,8 @@ import { findArchiveSnapshot, parseArchiveUrl } from './archive-today.js';
 import { claimTicket, createTicket, readTicket, settleTicket } from './handoff.js';
 import { isLlmConfigured, assessArticle } from './llm.js';
 import { createNarrator } from './narrator.js';
-import { isTtsConfigured, listVoices } from './tts.js';
+import { shortlistVoices, toneProfile } from './narration.js';
+import { isTtsConfigured, listVoices, prewarmVoices } from './tts.js';
 import { safeFetch } from './net.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -233,6 +234,9 @@ if (DEMO_MODE) {
 app.listen(PORT, () => {
   const mode = DEMO_MODE ? `demo at ${BASE || '/'}` : 'library';
   console.log(`particle ${mode} listening on :${PORT}`);
+  // The catalogue is a network round trip the first article would otherwise
+  // wait on, and it changes about as often as the provider ships voices.
+  if (narrator) prewarmVoices().catch(() => {});
 });
 
 function registerLibraryRoutes(router) {
@@ -377,10 +381,19 @@ function registerNarrationRoutes(router) {
     return article;
   };
 
+  /* `for` is an article id: the same ranking that cast it, so the picker offers
+     the voices that suit this piece rather than whichever the provider lists
+     first. Without it the catalogue comes back in the provider's own order. */
   router.get(api('/narration/voices'), async (req, res) => {
     try {
       const voices = await listVoices(String(req.query.lang || 'en'));
-      res.json(voices.map(({ id, title, description, tags, sample }) => ({ id, title, description, tags, sample })));
+      const article = req.query.for ? store.getArticle(Number(req.query.for)) : null;
+      const profile = article ? toneProfile(article) : null;
+      const ranked = article ? shortlistVoices(article, voices, profile) : voices;
+      res.json(ranked.map(({ id, title, description, tags, sample }, index) => ({
+        id, title, description, tags, sample,
+        suits: Boolean(article) && index < 6,
+      })));
     } catch (error) {
       res.status(502).json({ error: error.message });
     }
@@ -411,6 +424,30 @@ function registerNarrationRoutes(router) {
     } catch (error) {
       res.status(502).json({ error: error.message });
     }
+  });
+
+  /* What the narration is doing right now, as it does it. Casting and synthesis
+     take real seconds and a reader deserves to know which one they are in, so
+     the stages are streamed rather than guessed at by the client. Registered
+     ahead of the segment route: "status" is not a segment number. */
+  router.get(api('/articles/:id/narration/status'), (req, res) => {
+    const article = findArticle(req, res);
+    if (!article) return;
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      'Connection': 'keep-alive',
+      // nginx buffers event streams into uselessness unless told not to
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders?.();
+
+    const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+    const stop = narrator.watch(article.id, send);
+    // a comment frame no client reads, purely so proxies keep the socket open
+    const beat = setInterval(() => res.write(': beat\n\n'), 15_000);
+    beat.unref?.();
+    req.on('close', () => { clearInterval(beat); stop(); });
   });
 
   router.get(api('/articles/:id/narration/:seq'), async (req, res) => {

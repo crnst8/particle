@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildScript, speakable, splitForSynthesis, detectLanguage, toneProfile,
-  shortlistVoices, segmentStyle, contentHash, planNarration,
+  shortlistVoices, segmentStyle, contentHash, planNarration, castingReason,
 } from '../server/narration.js';
 import { narrationRev } from '../server/narrator.js';
 
@@ -195,6 +195,65 @@ test('voices are ranked by fit with the article, not by popularity alone', () =>
   assert.equal(ranked[0].id, 'calm');
 });
 
+test('a voice tagged every way loses to one that is actually the brief', () => {
+  const voices = [
+    // the shape that used to win everything: enough tags to match any profile
+    {
+      id: 'everything', title: 'Everything', popularity: 2_000_000, description: '',
+      tags: ['clear', 'crisp', 'smooth', 'calm', 'measured', 'professional', 'neutral-tone',
+        'confident', 'social-media', 'narration', 'educational', 'energetic', 'advertisement'],
+    },
+    {
+      id: 'reader', title: 'Reader', popularity: 900, description: '',
+      tags: ['narration', 'warm', 'measured', 'storytelling', 'calm', 'smooth'],
+    },
+  ];
+  const ranked = shortlistVoices(article({ tags: ['memoir'] }), voices);
+  assert.equal(ranked[0].id, 'reader');
+});
+
+test('the same voice re-uploaded under one name appears once', () => {
+  const voices = Array.from({ length: 5 }, (_, i) => ({
+    id: `clone${i}`, title: 'Slax', popularity: 1000 * i, description: '',
+    tags: ['narration', 'calm', 'measured', 'clear'],
+  })).concat({
+    id: 'other', title: 'Someone Else', popularity: 10, description: '',
+    tags: ['narration', 'calm'],
+  });
+  const ranked = shortlistVoices(article(), voices);
+  assert.equal(ranked.filter(voice => voice.title === 'Slax').length, 1);
+  assert.equal(ranked.length, 2);
+});
+
+test('a voice the library just heard gives way to an equal one it has not', () => {
+  const voices = [
+    { id: 'heard', title: 'Heard', popularity: 5000, description: '', tags: ['narration', 'calm', 'measured', 'clear'] },
+    { id: 'fresh', title: 'Fresh', popularity: 5000, description: '', tags: ['narration', 'calm', 'measured', 'clear'] },
+  ];
+  const piece = article();
+  const withoutAvoid = shortlistVoices(piece, voices);
+  assert.equal(shortlistVoices(piece, voices, undefined, { avoid: [withoutAvoid[0].id] })[0].id,
+    withoutAvoid[1].id);
+});
+
+test('selling tags cost a voice the reading', () => {
+  const voices = [
+    { id: 'seller', title: 'Seller', popularity: 10, description: '', tags: ['clear', 'calm', 'advertisement', 'social-media', 'energetic'] },
+    { id: 'plain', title: 'Plain', popularity: 10, description: '', tags: ['clear', 'calm'] },
+  ];
+  assert.equal(shortlistVoices(article({ tags: ['software'] }), voices)[0].id, 'plain');
+});
+
+test('the casting reason names what the voice was picked on', () => {
+  const reason = castingReason(
+    { id: 'v', title: 'V', tags: ['narration', 'calm', 'measured', 'deep'] },
+    toneProfile(article({ tags: ['philosophy'] })),
+  );
+  assert.match(reason, /measured/);
+  assert.match(reason, /essay/);
+  assert.doesNotMatch(reason, /deep/);
+});
+
 test('ranking is stable for one article and differs across articles', () => {
   const voices = Array.from({ length: 8 }, (_, i) => ({
     id: `v${i}`, title: `V${i}`, tags: ['narration', 'clear'], popularity: 1000, description: '',
@@ -241,8 +300,9 @@ test('picking a voice swaps the voice and keeps the direction already written', 
   assert.equal(direction.voice_id, 'new-voice');
   assert.equal(direction.source, 'manual');
   assert.equal(direction.speed, 0.94);
-  assert.equal(direction.reason, 'essay tone, warm');
   assert.deepEqual(direction.pronunciations, reuse.pronunciations);
+  // the pacing belongs to the article, the reason belonged to the voice it replaced
+  assert.match(direction.reason, /chosen by hand/);
   assert.ok(script.segments.length > 0);
 });
 

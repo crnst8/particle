@@ -218,9 +218,12 @@ on trim mode:
   - Footnote markers vanish; links are read as their domain, not character by character.
   - `12%`, `$1.2bn`, `e.g.`, `2019–2024` and em dashes are said the way a person would.
 - Casts a voice per article from the provider's catalogue — subject, length and
-  the article's own tags decide the register. With an LLM key configured it also
-  writes the spoken opening line and a pronunciation list for the names, acronyms
-  and product names in *that* article.
+  the article's own tags decide the register. A voice is ranked on how much of
+  that register it covers *and* how much of the voice that register is, so a
+  narrator tagged fourteen ways stops matching everything, and the voices the
+  library heard most recently give way to ones it has not. With an LLM key
+  configured it also writes the spoken opening line and a pronunciation list for
+  the names, acronyms and product names in *that* article.
 - Speaks an opening line: publication, title, author, running time.
 - Playback: scrub bar, 15-second skips, speeds from 0.85× to 2×, and a resume
   point synced with the rest of the library.
@@ -231,7 +234,12 @@ on trim mode:
   highlighted and scrolls into view.
 - Synthesis follows playback, so an article you abandon after a paragraph costs a
   paragraph. Audio is cached in the same SQLite file and replays for free.
-- Voices can be swapped, or the whole narration recast, from the player.
+- Voices can be swapped, or the whole narration recast, from the player. The
+  picker offers the voices that suit the article first, then the rest of the
+  catalogue.
+- Says what it is doing while it does it: casting, ranking, writing the script,
+  reading a passage — streamed from the server as it happens, with the seconds
+  counted once a step runs long, so a wait is never an unexplained pause.
 - Disabled by default until configured.
 
 ### Optional AI Tagging
@@ -289,9 +297,10 @@ next to the compose file — see [`.env.example`](.env.example).
 | `TTS_MODEL` | `s2.1-pro-free` | Voice model sent in the `model` header |
 | `TTS_VOICE_ID` | unset | Pin one voice instead of casting per article |
 | `TTS_VOICE_LOCK` | `0` | Set to `1` to use `TTS_VOICE_ID` for everything |
+| `TTS_VOICE_DENY` | unset | Title substrings, comma separated, to keep out of the catalogue |
 | `TTS_BITRATE` | `64` | mp3 bitrate: 64, 128 or 192 kbps |
 | `TTS_SEGMENT_CHARS` | `1100` | Largest chunk of text sent in one request |
-| `TTS_CONCURRENCY` | `2` | Synthesis requests in flight at once |
+| `TTS_CONCURRENCY` | `4` | Synthesis requests in flight at once; a segment the player is waiting on goes first |
 | `TTS_WARM_AHEAD` | `3` | Segments synthesised ahead of playback |
 | `TTS_MAX_CACHE_MB` | `512` | Ceiling for cached narration audio |
 
