@@ -1,3 +1,7 @@
+## 1.3.1 — 2026-09-03
+
+- feat: ocr start for pdf
+
 ## 1.3.0 — 2026-09-03
 
 - feat: PDF extraction
