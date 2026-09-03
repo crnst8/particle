@@ -1,3 +1,10 @@
+## 1.3.2 — 2026-09-03
+
+- fixes overlapping voice bug
+- fixes audio timeout without recovery
+- fixes slow loadtime on tts recast
+- fixes default narration casting
+
 ## Unreleased
 
 - fix: casting no longer lands on one voice for the whole library — a voice is
