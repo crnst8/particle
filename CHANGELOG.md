@@ -1,3 +1,9 @@
+## 1.3.3 — 2026-09-03
+
+- feat: screenshot link extraction (beta)
+
+requires LLM key
+
 ## 1.3.2 — 2026-09-03
 
 - fixes overlapping voice bug
