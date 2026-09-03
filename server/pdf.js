@@ -7,9 +7,13 @@
 
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { canvasFactory, ocrEnabled, ocrMaxPages, ocrPage } from './ocr.js';
 
 const require = createRequire(import.meta.url);
 const MAX_PAGES = positiveInt(process.env.PDF_MAX_PAGES, 300);
+// Below this much text a page is a picture of a page, and is worth reading with
+// OCR — a caption under a scan clears nothing like it.
+const TEXT_LAYER_FLOOR = positiveInt(process.env.PDF_TEXT_FLOOR, 100);
 
 // pdf.js is a megabyte of parser that most saves never touch: load it on first use.
 let pdfjs = null;
@@ -40,8 +44,8 @@ export function isPdfBytes(bytes) {
 export class PdfError extends Error {}
 
 /** Read a PDF into the same shape Readability hands back for a web page. */
-export async function readPdf(bytes, { maxPages = MAX_PAGES } = {}) {
-  const { getDocument } = await loadPdfjs();
+export async function readPdf(bytes, { maxPages = MAX_PAGES, ocr = ocrEnabled } = {}) {
+  const { getDocument, OPS } = await loadPdfjs();
   const task = getDocument({
     data: new Uint8Array(bytes),
     standardFontDataUrl: assetDir('standard_fonts'),
@@ -51,6 +55,8 @@ export async function readPdf(bytes, { maxPages = MAX_PAGES } = {}) {
     isEvalSupported: false,
     useSystemFonts: false,
     verbosity: 0,
+    // Rendering a scan needs somewhere to draw, and pdf.js cannot make one itself.
+    ...(ocr ? { CanvasFactory: await canvasFactory() } : {}),
   });
 
   let doc;
@@ -65,10 +71,15 @@ export async function readPdf(bytes, { maxPages = MAX_PAGES } = {}) {
   try {
     const pageCount = doc.numPages;
     const pages = [];
+    let scanned = 0;
+    let unread = 0;
     for (let n = 1; n <= Math.min(pageCount, maxPages); n += 1) {
       const page = await doc.getPage(n);
       try {
-        pages.push(await readPage(page, n));
+        const read = await readPage(page, n, ocr ? OPS : null, scanned < ocrMaxPages);
+        if (read.scanned) scanned += 1;
+        if (read.unread) unread += 1;
+        pages.push(read);
       } finally {
         page.cleanup();
       }
@@ -76,18 +87,22 @@ export async function readPdf(bytes, { maxPages = MAX_PAGES } = {}) {
 
     const info = (await doc.getMetadata().catch(() => null))?.info || {};
     const lines = dropRunningHeads(pages);
-    const bodySize = dominantSize(lines);
-    const title = pickTitle(info, pages[0], bodySize);
-    const blocks = assembleBlocks(stripTitleLines(lines, title), bodySize);
+    const spaces = measureSpaces(lines);
+    const title = pickTitle(info, pages[0], spaces);
+    const blocks = assembleBlocks(stripTitleLines(lines, title), spaces);
 
     return {
       title,
-      byline: cleanAuthor(info.Author),
+      byline: cleanAuthor(info.Author) || printedByline(lines),
       publishedAt: pdfDate(info.CreationDate) || pdfDate(info.ModDate),
       html: renderBlocks(blocks),
       text: blocks.map(blockText).join('\n\n').trim(),
       pageCount,
       truncated: pageCount > maxPages,
+      ocrPages: scanned,
+      // Pages that needed OCR and did not get it: the reader should know the
+      // article has holes in it rather than wonder where the middle went.
+      unreadPages: unread,
     };
   } finally {
     await task.destroy().catch(() => {});
@@ -96,7 +111,7 @@ export async function readPdf(bytes, { maxPages = MAX_PAGES } = {}) {
 
 /* ── one page → ordered lines ─────────────────────────────────────────────── */
 
-async function readPage(page, number) {
+async function readPage(page, number, OPS, mayScan) {
   const content = await page.getTextContent();
   const [, viewBottom, , viewTop] = page.view;
   const runs = [];
@@ -111,8 +126,55 @@ async function readPage(page, number) {
     runs.push({ str: item.str, x0: x, x1: x + (item.width || 0), y, size });
   }
 
-  const lines = orderByColumn(groupRows(runs)).map(line => ({ ...line, page: number }));
-  return { number, lines, top: viewTop, bottom: viewBottom };
+  if (OPS && charCount(runs) < TEXT_LAYER_FLOOR) {
+    if (!mayScan) return { number, lines: [], top: viewTop, bottom: viewBottom, unread: true };
+    const scan = await readByEye(page, OPS);
+    // Words in image pixels, so the page keeps the reckoning they were set in.
+    if (scan && charCount(scan.runs) > charCount(runs)) {
+      return { ...layOut(scan.runs, number, `scan:${number}`), top: scan.height, bottom: 0, scanned: true };
+    }
+  }
+
+  return { ...layOut(runs, number, 'text'), top: viewTop, bottom: viewBottom };
+}
+
+/* Pages are measured against their own kind. A page read by eye is measured in
+   the pixels of the picture it was read from, which has nothing to do with the
+   points the pages around it are set in — pooling the two would give a document
+   one meaningless idea of a body size, a leading and a column. */
+function layOut(runs, number, space) {
+  const lines = reuniteDropCaps(orderByColumn(groupRows(runs)));
+  return { number, lines: lines.map(line => ({ ...line, page: number, space })) };
+}
+
+/* A drop cap is one letter set three lines deep at the head of a paragraph. It
+   keeps a baseline of its own, well below the line it opens, so left where it
+   falls it arrives as a stray letter in the middle of the text and its
+   paragraph starts a word short: "ith a pair of Gucci glasses". */
+function reuniteDropCaps(lines) {
+  const body = dominantSize(lines);
+  const kept = [];
+  for (const line of lines) {
+    const cap = /^\p{Lu}$/u.test(line.text) && line.size >= body * 1.8;
+    const opens = cap && kept.find(other => other.y > line.y && other.y <= line.y + line.size
+      && other.x0 >= line.x1 - line.size * 0.5);
+    if (!opens) { kept.push(line); continue; }
+    opens.text = line.text + opens.text;
+    opens.x0 = Math.min(opens.x0, line.x0);
+  }
+  return kept;
+}
+
+const charCount = runs => runs.reduce((total, run) => total + run.str.trim().length, 0);
+
+// A scan that cannot be read is a page without text, not a document without one.
+async function readByEye(page, OPS) {
+  try {
+    return await ocrPage(page, OPS);
+  } catch (error) {
+    console.error(`ocr page ${page.pageNumber} failed:`, error.message);
+    return null;
+  }
 }
 
 /* Runs sharing a baseline are one row of type. On a multi-column page that is
@@ -120,6 +182,10 @@ async function readPage(page, number) {
    a row is ever read as a line. */
 function groupRows(runs) {
   const sorted = [...runs].sort((p, q) => (q.y - p.y) || (p.x0 - q.x0));
+  // Words read by eye already know which line they were set on. Only a text
+  // layer, which knows nothing but coordinates, has to be grouped by baseline.
+  if (sorted.some(run => run.row !== undefined)) return groupByRow(sorted);
+
   const rows = [];
   let current = null;
   for (const run of sorted) {
@@ -130,6 +196,22 @@ function groupRows(runs) {
     current.runs.push(run);
     current.size = Math.max(current.size, run.size);
     current.y = Math.max(current.y, run.y);
+  }
+  return rows;
+}
+
+function groupByRow(sorted) {
+  const rows = [];
+  const seen = new Map();
+  for (const run of sorted) {
+    let row = seen.get(run.row);
+    if (!row) {
+      row = { y: run.y, size: run.size, runs: [] };
+      seen.set(run.row, row);
+      rows.push(row);
+    }
+    row.runs.push(run);
+    row.size = Math.max(row.size, run.size);
   }
   return rows;
 }
@@ -275,19 +357,42 @@ function dominantSize(lines) {
   return [...tally].sort((p, q) => q[1] - p[1])[0]?.[0] || 11;
 }
 
-function assembleBlocks(lines, bodySize) {
-  const leading = medianLeading(lines);
-  const columnLeft = percentile(lines.map(line => line.x0), 0.15);
-  const columnWidth = Math.max(1, percentile(lines.map(line => line.x1), 0.92) - columnLeft);
-  const column = { left: columnLeft, width: columnWidth, leading };
+/* One set of measurements per coordinate space: the body size, the leading and
+   the column that everything downstream is judged against. */
+function measureSpaces(lines) {
+  const grouped = new Map();
+  for (const line of lines) {
+    if (!grouped.has(line.space)) grouped.set(line.space, []);
+    grouped.get(line.space).push(line);
+  }
+
+  const spaces = new Map();
+  for (const [space, own] of grouped) {
+    const left = percentile(own.map(line => line.x0), 0.15);
+    spaces.set(space, {
+      left,
+      width: Math.max(1, percentile(own.map(line => line.x1), 0.92) - left),
+      leading: medianLeading(own),
+      bodySize: dominantSize(own),
+    });
+  }
+  return spaces;
+}
+
+const FALLBACK_SPACE = { left: 0, width: 1, leading: 14, bodySize: 11 };
+const measure = (spaces, line) => spaces.get(line?.space) || FALLBACK_SPACE;
+
+function assembleBlocks(lines, spaces) {
+  const runs = runLengths(lines);
   const blocks = [];
   let open = null;
 
   for (const [index, line] of lines.entries()) {
     const prev = index ? lines[index - 1] : null;
     const next = lines[index + 1] || null;
+    const column = measure(spaces, line);
 
-    const level = headingLevel(line, bodySize, { prev, next, column });
+    const level = headingLevel(line, column.bodySize, { prev, next, column, run: runs[index] });
     if (level) { open = null; blocks.push({ type: 'h', level, text: line.text }); continue; }
 
     const bullet = BULLET.exec(line.text);
@@ -299,16 +404,16 @@ function assembleBlocks(lines, bodySize) {
     }
 
     // A line set in from the bullet it follows is the rest of that bullet.
-    if (open?.type === 'ul' && line.x0 > open.x0 + line.size * 0.5 && !separated(prev, line, leading)) {
+    if (open?.type === 'ul' && line.x0 > open.x0 + line.size * 0.5 && !separated(prev, line, column.leading)) {
       open.items[open.items.length - 1] = join(open.items[open.items.length - 1], line.text);
       open.right = Math.max(open.right, line.x1);
       continue;
     }
 
     const broken = open?.type !== 'p'
-      || separated(prev, line, leading)
+      || separated(prev, line, column.leading)
       || Math.abs(line.size - open.size) > 1
-      || firstLineIndent(prev, line, columnWidth)
+      || firstLineIndent(prev, line, column.width)
       || shortLastLine(prev, Math.max(open.right, line.x1));
 
     if (broken) blocks.push(open = { type: 'p', text: line.text, size: line.size, right: line.x1 });
@@ -326,6 +431,7 @@ const BULLET = /^[\u2022\u2023\u25aa\u25e6\u25cf\u25cb\u2219\u00b7\u2013\u2014*]
 // Across a page break, only an unfinished sentence carries the paragraph over.
 function separated(prev, line, leading) {
   if (!prev) return true;
+  if (prev.space !== line.space) return true;
   if (prev.page !== line.page) return /[.!?:;)"'\u201d\u2019]$/.test(prev.text) || !/^[a-z(\u201c"']/.test(line.text);
   const gap = prev.y - line.y;
   return gap < 0 || gap > leading * 1.45;
@@ -346,9 +452,28 @@ function shortLastLine(prev, right) {
   return prev.x1 < right - prev.size * 2 && /[.!?"'\u201d\u2019]$/.test(prev.text);
 }
 
-function headingLevel(line, bodySize, { prev, next, column }) {
+/* How many lines in a row are set at this one's size. A heading stands on its
+   own; a lede or a standfirst is body text set large and runs on for lines. */
+function runLengths(lines) {
+  const lengths = new Array(lines.length).fill(1);
+  let start = 0;
+  for (let index = 1; index <= lines.length; index += 1) {
+    const same = index < lines.length && lines[index].size === lines[index - 1].size
+      && lines[index].space === lines[index - 1].space;
+    if (same) continue;
+    for (let back = start; back < index; back += 1) lengths[back] = index - start;
+    start = index;
+  }
+  return lengths;
+}
+
+function headingLevel(line, bodySize, { prev, next, column, run }) {
   const text = line.text;
   if (text.length > 160 || !/[a-z0-9]/i.test(text)) return null;
+  // Larger type alone does not make a heading. A lede is body text set big, a
+  // pull quote runs for lines, and a paragraph opening on a drop cap measures
+  // as tall as the cap — all of them run on, and a heading does not.
+  if (run > 2) return null;
   const ratio = line.size / bodySize;
   if (ratio >= 1.5) return 2;
   if (ratio >= 1.16) return 3;
@@ -404,10 +529,10 @@ function percentile(values, p) {
 /* /Title is often the source document's filename, or whatever the exporter
    pasted in ("printmgr file"), so it is only trusted when the document also
    prints it. Otherwise the largest type on page one is the honest answer. */
-function pickTitle(info, firstPage, bodySize) {
+function pickTitle(info, firstPage, spaces) {
   const declared = cleanTitle(info.Title);
   if (declared && firstPage && printedOn(firstPage, declared)) return declared;
-  return largestOn(firstPage, bodySize) || declared || null;
+  return largestOn(firstPage, measure(spaces, firstPage?.lines[0]).bodySize) || declared || null;
 }
 
 function printedOn(page, title) {
@@ -418,7 +543,9 @@ function printedOn(page, title) {
 function largestOn(page, bodySize) {
   if (!page) return null;
   const half = page.bottom + (page.top - page.bottom) * 0.45;
-  const candidates = page.lines.filter(line => line.y >= half && line.size > bodySize * 1.15
+  // Counted in lines as well as in height: half of a page that is one long
+  // screenshot is thousands of lines, and the title is in the first few.
+  const candidates = page.lines.slice(0, 15).filter(line => line.y >= half && line.size > bodySize * 1.15
     && /[a-z]/i.test(line.text) && line.text.length <= 200);
   if (!candidates.length) return null;
 
@@ -432,7 +559,9 @@ function cleanTitle(value) {
   let title = String(value || '').replace(/\s+/g, ' ').trim();
   // Word and friends title the export after the file they exported.
   title = title.replace(/^Microsoft (?:Word|PowerPoint|Publisher)\s*-\s*/i, '');
-  title = title.replace(/\.(pdf|docx?|pptx?|indd|tex|pages)$/i, '');
+  title = title.replace(/\.(pdf|docx?|pptx?|indd|tex|pages|png|jpe?g|tiff?|webp|gif)$/i, '');
+  // "screenshot-example.com-2018.04.24-09-45-12" names the capture, not the piece.
+  if (/^(screen ?shot|capture|scan|img|image|photo|untitled)[-_ \d.]/i.test(title)) return null;
   if (!title || title.length > 300) return null;
   if (/^(untitled|document\d*|slide \d+|print|final|draft|no title)$/i.test(title)) return null;
   return /[a-z]/i.test(title) ? title : null;
@@ -446,6 +575,17 @@ function cleanAuthor(value) {
   const author = String(value || '').replace(/\s+/g, ' ').trim();
   if (!author || author.length > 200 || NOT_A_PERSON.test(author)) return null;
   return author;
+}
+
+/* Nothing in a PDF records an author, so a piece that prints one under its
+   title is the only place to find it. "Illustration by ..." is somebody else. */
+function printedByline(lines) {
+  for (const line of lines.slice(0, 12)) {
+    const match = /^by[:\s]\s*([\p{Lu}][\p{L}'’.-]*(?:[\s,&]+(?:and\s+)?[\p{Lu}][\p{L}'’.-]*){0,5})$/iu
+      .exec(line.text.trim());
+    if (match) return match[1].trim();
+  }
+  return null;
 }
 
 // PDF dates are D:YYYYMMDDHHmmSS with an offset written as +HH'mm'.

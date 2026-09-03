@@ -1,5 +1,7 @@
 node_modules/
 data/
+# Tesseract writes a working copy of its language model beside the process.
+*.traineddata
 .dev/
 .env
 .DS_Store

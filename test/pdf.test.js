@@ -2,50 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { isPdfBytes, looksLikePdfUrl, readPdf } from '../server/pdf.js';
 import { extractArticle } from '../server/extract.js';
-
-/* A PDF is glyphs at coordinates, so the fixtures are written that way too:
-   each run is a string placed at an (x, y) in points, at a point size. */
-function makePdf(pages, meta = {}) {
-  const esc = value => String(value).replace(/([\\()])/g, '\\$1');
-  const objects = [];
-  const add = body => objects.push(body);
-
-  const catalog = add(null);
-  const pageList = add(null);
-  const font = add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
-
-  const kids = pages.map((runs) => {
-    const ops = runs.map(run =>
-      `BT /F1 ${run.size ?? 11} Tf ${run.x ?? 72} ${run.y} Td (${esc(run.text)}) Tj ET`).join('\n');
-    const content = add(`<< /Length ${ops.length} >>\nstream\n${ops}\nendstream`);
-    return add(`<< /Type /Page /Parent ${pageList} 0 R /MediaBox [0 0 612 792]`
-      + ` /Resources << /Font << /F1 ${font} 0 R >> >> /Contents ${content} 0 R >>`);
-  });
-
-  objects[catalog - 1] = `<< /Type /Catalog /Pages ${pageList} 0 R >>`;
-  objects[pageList - 1] = `<< /Type /Pages /Kids [${kids.map(k => `${k} 0 R`).join(' ')}]`
-    + ` /Count ${kids.length} >>`;
-  const info = add(`<< ${meta.title ? `/Title (${esc(meta.title)}) ` : ''}`
-    + `${meta.author ? `/Author (${esc(meta.author)}) ` : ''}`
-    + `${meta.date ? `/CreationDate (${esc(meta.date)}) ` : ''}>>`);
-
-  let out = '%PDF-1.4\n';
-  const offsets = objects.map((body, i) => {
-    const at = out.length;
-    out += `${i + 1} 0 obj\n${body}\nendobj\n`;
-    return at;
-  });
-  const startxref = out.length;
-  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
-    + offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('')
-    + `trailer\n<< /Size ${objects.length + 1} /Root ${catalog} 0 R /Info ${info} 0 R >>\n`
-    + `startxref\n${startxref}\n%%EOF\n`;
-  return Buffer.from(out, 'latin1');
-}
-
-// A body paragraph, laid out line by line down the page.
-const column = (lines, { top = 700, size = 11, x = 72, leading = 14 } = {}) =>
-  lines.map((text, i) => ({ text, x, y: top - i * leading, size }));
+import { column, makePdf } from './fixtures.js';
 
 function stubFetch(handler) {
   const original = globalThis.fetch;

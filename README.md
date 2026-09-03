@@ -97,9 +97,29 @@ of interrupting a sentence. The title comes from the PDF's metadata only when
 the document actually prints it; otherwise it is taken from the largest type on
 page one. The result is sanitised and stored exactly like a scraped page.
 
-A scanned PDF with no text layer is refused rather than saved empty — it needs
-OCR, which particle does not do. Images inside a PDF are not extracted.
-`PDF_MAX_BYTES` and `PDF_MAX_PAGES` bound the work; see `.env.example`.
+Images inside a PDF are not extracted. `PDF_MAX_BYTES` and `PDF_MAX_PAGES`
+bound the work; see `.env.example`.
+
+### Scanned PDFs (OCR)
+A page carrying no text layer is a picture of a page, and is read with
+Tesseract. The words come back with their positions, so a scan goes through the
+same column, paragraph and heading reconstruction as any other PDF.
+
+The page is rendered at **the scan's own resolution, not the page's**. This is
+the difference between working and not: a long screenshot printed to PDF is
+squeezed into whatever box the printer chose — a 708×12030 pixel capture can
+land in a 46-point-wide sliver of a letter page — and rendering that at page
+scale reads a column of text as a 46-pixel smear. Particle measures the pixels
+the image actually has and renders to match.
+
+Tall pages are sliced before reading, and the cuts fall only in blank bands, so
+no line is ever read in halves. Slices are read in parallel.
+
+The language model (~15MB) is downloaded on first use and cached beside the
+database; set `OCR_LANG_PATH` to a local directory for an air-gapped install.
+`OCR_MAX_PAGES` caps how many scanned pages one document may cost — past it the
+article is saved and marked partial rather than holding the queue. Set
+`OCR_ENABLED=0` to switch it off, and a scan then fails instead of being read.
 
 ### archive.today snapshots
 - Paste an `archive.is/…` link and particle reads that capture, filing it under

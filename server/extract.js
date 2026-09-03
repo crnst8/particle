@@ -243,19 +243,22 @@ async function parsePdfAttempt(bytes, url, method) {
 
   const text = (doc.text || '').trim();
   const wordCount = text ? text.split(/\s+/).length : 0;
-  // Glyphs are the only thing a PDF is obliged to carry. A scan carries none,
-  // and no amount of retrying elsewhere will produce them.
+  // Glyphs are the only thing a PDF is obliged to carry, and a scan carries
+  // none: OCR is the last reader, so if it found nothing there is nothing.
   if (!wordCount) {
-    return { ok: false, meta: {}, reason: `no text layer in ${doc.pageCount} page(s) — a scan, so it needs OCR` };
+    return { ok: false, meta: {}, reason: doc.ocrPages
+      ? `nothing legible in ${doc.pageCount} scanned page(s)`
+      : `no text layer in ${doc.pageCount} page(s), and OCR is switched off` };
   }
 
   const paywallReason = looksPaywalled(text, wordCount);
   const notes = [];
   if (doc.truncated) notes.push(`only part of this ${doc.pageCount}-page PDF was read`);
+  if (doc.unreadPages) notes.push(`${doc.unreadPages} scanned page(s) went unread — past the OCR limit`);
 
   return {
-    ok: !paywallReason,
-    reason: paywallReason,
+    ok: !paywallReason && !doc.unreadPages,
+    reason: paywallReason || (doc.unreadPages ? notes[notes.length - 1] : null),
     meta: {},
     result: {
       title: doc.title || titleFromPath(url),
@@ -268,7 +271,7 @@ async function parsePdfAttempt(bytes, url, method) {
       lead_image: null,
       published_at: doc.publishedAt,
       canonical_url: url,
-      fetch_method: `${method} (pdf)`,
+      fetch_method: `${method} (pdf${doc.ocrPages ? ', ocr' : ''})`,
       ...(notes.length ? { quality_note: notes.join('; ') } : {}),
     },
   };
