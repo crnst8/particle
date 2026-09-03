@@ -1,3 +1,9 @@
+## 1.3.0 — 2026-09-03
+
+- feat: PDF extraction
+
+This release adds basic PDF extractor tools. OCR & image parsing to come.
+
 ## 1.2.1 — 2026-08-27
 
 - feat: reader overhaul & better visual feedback
