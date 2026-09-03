@@ -128,6 +128,43 @@ export async function stopOcr() {
   try { await (await queue)?.terminate(); } catch { /* already gone */ }
 }
 
+/* ── one loose picture ────────────────────────────────────────────────────── */
+
+/** Read a picture that is not a page of anything — a screenshot the reader
+    handed over. Returns lines top to bottom with their boxes: where a line sits
+    and how tall it is set is most of what separates a headline from the app
+    furniture around it. */
+export async function ocrImage(bytes) {
+  outstanding += 1;
+  clearTimeout(idleTimer);
+  try {
+    const queue = await scheduler();
+    const { data } = await queue.addJob('recognize', bytes, {}, { blocks: true });
+    const lines = [];
+    for (const block of data.blocks || []) {
+      for (const paragraph of block.paragraphs || []) {
+        for (const line of paragraph.lines || []) {
+          if (!line.words?.length || line.confidence < MIN_CONFIDENCE) continue;
+          const words = line.words.filter(word => word.text?.trim() && word.confidence >= MIN_CONFIDENCE);
+          if (!words.length) continue;
+          lines.push({
+            text: words.map(word => word.text.trim()).join(' '),
+            x: line.bbox.x0,
+            y: line.bbox.y0,
+            width: line.bbox.x1 - line.bbox.x0,
+            height: line.bbox.y1 - line.bbox.y0,
+            confidence: Math.round(line.confidence),
+          });
+        }
+      }
+    }
+    return lines.sort((one, other) => one.y - other.y);
+  } finally {
+    outstanding -= 1;
+    releaseWhenIdle();
+  }
+}
+
 /* ── one page ─────────────────────────────────────────────────────────────── */
 
 /** Read a page's pictures as text. Returns runs in image pixels — the space the

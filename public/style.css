@@ -272,6 +272,100 @@ input { font: inherit; color: inherit; }
 }
 .rescue-go:hover { color: var(--ink); }
 
+/* ── Screenshot ────────────────────────────────────────────────────────────
+   The picker is the moment particle admits it guessed. It shows what it found
+   and where it found it, and waits — a screenshot naming four articles is not
+   four articles the reader asked for. */
+
+.shot-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 2rem; padding: 0; color: var(--ink-3);
+  background: none; border: 0; cursor: pointer; transition: color .15s, transform .15s;
+}
+.shot-btn:hover, #save-form:focus-within .shot-btn { color: var(--accent); }
+.shot-btn:active { transform: scale(.92); }
+.shot-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Reading a screenshot is the one save that can run for a minute. For all of
+   that minute the field is useless — there is nothing to type and nothing to
+   press — so it steps aside and the progress takes its place: what stage it is
+   in, how long it has been, and a way out. */
+.shot-progress {
+  flex: 1; display: flex; align-items: center; gap: .6rem;
+  padding: .65rem 0; font-size: .92rem; color: var(--ink-2); min-width: 0;
+}
+#save-form.is-busy > :not(.shot-progress) { display: none; }
+
+.shot-spin {
+  flex: none; width: .85rem; height: .85rem; border-radius: 50%;
+  border: 1.5px solid var(--line); border-top-color: var(--accent);
+  animation: shot-spin .7s linear infinite;
+}
+@keyframes shot-spin { to { transform: rotate(360deg); } }
+
+.shot-stage {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  animation: shot-breathe 1.8s ease-in-out infinite;
+}
+.shot-elapsed { flex: none; color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: .82rem; }
+.shot-stop {
+  flex: none; font: inherit; font-size: .82rem; color: var(--ink-3);
+  background: none; border: 0; padding: 0 .25rem; cursor: pointer; text-decoration: underline;
+}
+.shot-stop:hover { color: var(--ink); }
+
+@keyframes shot-breathe { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+
+/* Moved as a gradient rather than a transform: the rule already sits outside the
+   form's box, so a travelling bar would run off the side of it. */
+body.is-reading-shot #save-form::after {
+  opacity: 1; transform: none; background: none;
+  background-image: linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size: 45% 100%; background-repeat: no-repeat;
+  animation: shot-sweep 1.4s linear infinite;
+}
+@keyframes shot-sweep {
+  from { background-position: -60% 0; }
+  to   { background-position: 160% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shot-stage, .shot-spin, body.is-reading-shot #save-form::after { animation: none; }
+  .shot-spin { border-top-color: var(--accent); border-right-color: var(--accent); }
+  body.is-reading-shot #save-form::after { opacity: .5; background-position: 50% 0; }
+}
+
+.shot-picker {
+  margin: .8rem 0 0; padding: .75rem .9rem; border: 1px solid var(--line);
+  background: var(--card); font-size: .82rem; line-height: 1.5;
+}
+.shot-head { margin: 0 0 .5rem; color: var(--ink); }
+.shot-row {
+  display: flex; gap: .55rem; align-items: flex-start;
+  padding: .35rem 0; cursor: pointer;
+}
+.shot-row input { margin-top: .28rem; accent-color: var(--accent); flex: none; }
+.shot-row-text { display: flex; flex-direction: column; min-width: 0; }
+.shot-title { color: var(--ink); overflow-wrap: anywhere; }
+.shot-where { color: var(--ink-3); font-size: .76rem; overflow-wrap: anywhere; }
+.shot-misses { margin: .5rem 0 0; padding: 0; list-style: none; }
+.shot-miss { display: flex; flex-direction: column; padding: .3rem 0; opacity: .7; }
+.shot-actions { display: flex; align-items: center; gap: .9rem; margin-top: .7rem; }
+.shot-go {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--ink-3); padding: .3rem .7rem;
+}
+.shot-go:hover:not(:disabled) { border-color: var(--ink); }
+.shot-go:disabled { color: var(--ink-3); cursor: default; }
+.shot-cancel {
+  font: inherit; color: var(--ink-2); background: none; border: 0; padding: 0;
+  cursor: pointer; text-decoration: underline;
+}
+.shot-cancel:hover { color: var(--ink); }
+
+/* Dragging a picture anywhere over the window is an offer to read it. */
+body.is-dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
+
 .lib-nav {
   display: flex;
   align-items: baseline;

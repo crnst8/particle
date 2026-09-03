@@ -42,9 +42,29 @@ __PARTICLE_ANALYTICS__
       <form id="save-form" autocomplete="off">
         <input id="url-input" type="url" inputmode="url" placeholder="paste a url, press enter"
                aria-label="Article URL" required>
+        <button id="shot-btn" class="shot-btn" type="button" title="Save from a screenshot (or paste one)"
+                aria-label="Save from a screenshot">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+            <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
+                  d="M3.75 5.5h16.5v13H3.75z"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                  d="m3.75 15.4 4.3-4.3 4.2 4.2 3-3 4.99 5"/>
+            <circle cx="15.4" cy="9.3" r="1.5" fill="currentColor"/>
+          </svg>
+        </button>
+        <input id="shot-input" type="file" accept="image/*" hidden>
         <button id="save-btn" type="submit">save</button>
+        <!-- Takes the field's place while a screenshot is being read: the wait
+             is long enough that leaving an empty input there invites a retype. -->
+        <div id="shot-progress" class="shot-progress" hidden>
+          <span class="shot-spin" aria-hidden="true"></span>
+          <span class="shot-stage" id="shot-stage" role="status" aria-live="polite">reading…</span>
+          <span class="shot-elapsed" id="shot-elapsed" aria-hidden="true"></span>
+          <button type="button" id="shot-stop" class="shot-stop">cancel</button>
+        </div>
       </form>
       <div id="save-status" class="save-status" role="status" aria-live="polite"></div>
+      <div id="shot-picker" class="shot-picker" hidden></div>
       <div id="rescue" class="rescue" role="status" aria-live="polite" hidden></div>
       <div id="demo-nudge" class="demo-nudge" hidden>
         Want this library everywhere? Run your own copy:

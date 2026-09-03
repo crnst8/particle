@@ -125,9 +125,13 @@
     return data;
   }
 
-  // Page source this browser fetched (or the reader pasted) after clearing a captcha.
+  // Page source this browser fetched (or the reader pasted) after clearing a captcha,
+  // and what to fall back to when the page will not be read at all.
   function sourceBody(source) {
-    return source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {};
+    return {
+      ...(source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {}),
+      ...(source?.linkFallback ? { link_fallback: source.linkFallback } : {}),
+    };
   }
 
   // ── routing ──────────────────────────────────────────────────────────────
@@ -279,7 +283,10 @@
     const mins = Math.max(1, Math.round((a.word_count || 0) / 230));
     const tags = (a.tags || []).join(', ');
     const lists = collectionNames(a);
-    const flag = a.quality === 'partial' || a.quality === 'stub' ? '<span class="row-flag" title="extraction may be incomplete">&#9679; partial</span>' : '';
+    const flag = a.quality === 'link'
+      ? '<span class="row-flag" title="the page could not be read; this is the link">&#9679; link</span>'
+      : a.quality === 'partial' || a.quality === 'stub'
+        ? '<span class="row-flag" title="extraction may be incomplete">&#9679; partial</span>' : '';
 
     li.innerHTML = `
       <div class="row-top">
@@ -291,7 +298,7 @@
       <div class="row-title">${esc(a.title || a.url)}</div>
       ${a.excerpt ? `<div class="row-excerpt">${esc(a.excerpt)}</div>` : ''}
       <div class="row-bottom">
-        <span>${mins} min</span>
+        <span>${a.quality === 'link' ? 'link only' : `${mins} min`}</span>
         ${a.progress > 0.02 && a.progress < 0.97 ? `<span class="row-progress"><i style="width:${Math.round(a.progress * 100)}%"></i></span>` : ''}
         ${a.read_at ? '<span>read</span>' : ''}
         ${a.edited_at ? '<span class="row-edited" title="you trimmed this article">trimmed</span>' : ''}
@@ -429,6 +436,259 @@
     searchTimer = setTimeout(() => { state.q = search.value; refresh(); }, 250);
   });
 
+  /* ── screenshot ───────────────────────────────────────────────────────────
+     The reader is in TikTok, a video mentions a piece, and a screenshot is the
+     only thing they can take with them. The server reads the picture and looks
+     the article up; this end offers what it found rather than filing it blind,
+     because a screenshot naming four articles is not four articles the reader
+     asked for. One find saves itself; several ask. */
+
+  const shotInput = $('shot-input'), shotPicker = $('shot-picker');
+
+  /* The server answers in stages, so the reader is told which one it is in, and
+     for as long as it runs the field steps aside and the progress takes its
+     place. A save that can take a minute should never leave an idle text box
+     sitting there: there is nothing to type into it, and a status line that has
+     not changed for forty seconds reads as a hang whether or not it is one. */
+  const shotStage = $('shot-stage'), shotElapsed = $('shot-elapsed');
+  let shotClock = null;
+  let shotAbort = null;
+
+  function shotBusy(text) {
+    shotStage.textContent = text;
+  }
+
+  function shotStart() {
+    shotAbort = new AbortController();
+    saveStatus.textContent = '';
+    saveStatus.classList.remove('error', 'ok');
+    shotPicker.hidden = true;
+    shotPicker.innerHTML = '';
+    form.classList.add('is-busy');
+    $('shot-progress').hidden = false;
+    document.body.classList.add('is-reading-shot');
+    shotBusy('uploading the screenshot…');
+
+    const from = Date.now();
+    shotElapsed.textContent = '';
+    clearInterval(shotClock);
+    // Only after a few seconds: a counter that starts at 0s makes a fast read
+    // look slow, and the point of it is to reassure during a long one.
+    shotClock = setInterval(() => {
+      const seconds = Math.round((Date.now() - from) / 1000);
+      shotElapsed.textContent = seconds >= 3 ? `${seconds}s` : '';
+    }, 1000);
+  }
+
+  function shotDone() {
+    clearInterval(shotClock);
+    shotClock = null;
+    shotAbort = null;
+    form.classList.remove('is-busy');
+    $('shot-progress').hidden = true;
+    saveBtn.disabled = false;
+    shotInput.value = '';
+    document.body.classList.remove('is-reading-shot');
+  }
+
+  $('shot-stop').addEventListener('click', () => shotAbort?.abort());
+
+  async function readShot(file) {
+    if (!file) return;
+    if (!/^image\//.test(file.type || '')) {
+      saveStatus.textContent = 'that is not an image';
+      saveStatus.classList.add('error');
+      return;
+    }
+    saveBtn.disabled = true;
+    shotStart();
+
+    let done = null;
+    try {
+      const res = await fetch(appUrl('/api/screenshot'), {
+        method: 'POST',
+        headers: { 'Content-Type': file.type },
+        body: file,
+        signal: shotAbort.signal,
+      });
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+
+      let looked = 0;
+      for await (const event of ndjson(res.body)) {
+        if (event.phase === 'received') shotBusy(`reading ${event.kb}KB…`);
+        else if (event.phase === 'reading') {
+          shotBusy(event.ocr ? 'reading the picture (no vision model — OCR)…' : 'reading the picture…');
+        } else if (event.phase === 'read') {
+          const [first, ...rest] = event.titles;
+          shotBusy(rest.length
+            ? `found ${event.titles.length} articles · looking them up…`
+            : `“${clip(first, 46)}” · looking it up…`);
+        } else if (event.phase === 'looked') {
+          looked += 1;
+          shotBusy(`${event.found ? 'found' : 'no link for'} “${clip(event.title, 40)}”${looked > 1 ? ` · ${looked} done` : ''}…`);
+        } else if (event.phase === 'failed') throw new Error(event.error);
+        else if (event.phase === 'done') done = event;
+      }
+      if (!done) throw new Error('that screenshot could not be read');
+
+      const found = done.candidates.filter(one => one.url);
+      const unresolved = done.candidates.filter(one => !one.url);
+      if (!found.length && !unresolved.length) throw new Error('no article could be read out of that screenshot');
+
+      /* One find, or one the picture confirmed twice over, is not a question —
+         it is what the reader took the screenshot for. Whatever else the picture
+         named is offered underneath afterwards rather than standing in the way. */
+      const [best, ...others] = found;
+      shotDone();
+      if (best && (best.certain || found.length === 1)) {
+        const article = await saveCandidate(best);
+        if (article && (others.length || unresolved.length)) {
+          offerCandidates(others, unresolved, { alsoFound: true });
+        }
+        return;
+      }
+      offerCandidates(found, unresolved);
+    } catch (error) {
+      const cancelled = error.name === 'AbortError';
+      shotDone();
+      saveStatus.textContent = cancelled ? 'stopped' : error.message;
+      saveStatus.classList.remove('ok');
+      if (!cancelled) saveStatus.classList.add('error');
+    }
+  }
+
+  /* One JSON object per line, handed over as each stage finishes. */
+  async function* ndjson(stream) {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      buffer += done ? '' : decoder.decode(value, { stream: true });
+      let cut;
+      while ((cut = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, cut).trim();
+        buffer = buffer.slice(cut + 1);
+        if (line) yield JSON.parse(line);
+      }
+      if (done) return;
+    }
+  }
+
+  const clip = (text, at) => (String(text || '').length > at ? `${String(text).slice(0, at - 1)}…` : String(text || ''));
+
+  /* What the picture said, kept for the save so a page that will not open is
+     still filed under its real title rather than its hostname. */
+  function candidateFallback(candidate) {
+    return {
+      title: candidate.title || null,
+      byline: candidate.byline || null,
+      site_name: candidate.publication || null,
+      excerpt: candidate.subtitle || candidate.excerpt || null,
+      published_at: candidate.published || null,
+    };
+  }
+
+  async function saveCandidate(candidate) {
+    saveStatus.classList.remove('error', 'ok');
+    saveStatus.textContent = `saving “${candidate.title || candidate.url}”…`;
+    try {
+      const article = await api.save(candidate.url, { linkFallback: candidateFallback(candidate) });
+      urlInput.value = '';
+      saveStatus.textContent = article.duplicate ? 'already in your library'
+        : article.quality === 'link' ? `saved “${article.title}” as a link — the page would not open`
+          : `saved “${article.title}”`;
+      if (!article.duplicate) celebrateSave(article.id);
+      refresh();
+      if (!DEMO) setTimeout(refresh, 9000);
+      return article;
+    } catch (error) {
+      saveStatus.textContent = error.message;
+      saveStatus.classList.add('error');
+      return null;
+    }
+  }
+
+  /* More than one article in the picture, or one that could not be looked up.
+     `alsoFound` is the gentler case: the certain one is already in the library
+     and these are the rest of what the picture named, offered rather than
+     pressed — so nothing is ticked and the heading does not ask for a decision. */
+  function offerCandidates(found, unresolved, { alsoFound = false } = {}) {
+    const rows = found.map((candidate, index) => `
+      <label class="shot-row">
+        <input type="checkbox" data-shot="${index}"${!alsoFound && index === 0 ? ' checked' : ''}>
+        <span class="shot-row-text">
+          <span class="shot-title">${esc(candidate.title || candidate.url)}</span>
+          <span class="shot-where">${esc(hostOf(candidate.url))}${candidate.via ? ` · found via ${esc(candidate.via)}` : ''}</span>
+        </span>
+      </label>`).join('');
+
+    const misses = unresolved.map(candidate => `
+      <li class="shot-miss">
+        <span class="shot-title">${esc(candidate.title || 'something unreadable')}</span>
+        <span class="shot-where">no link found${candidate.publication ? ` · ${esc(candidate.publication)}` : ''}</span>
+      </li>`).join('');
+
+    const head = alsoFound
+      ? `also in that screenshot${found.length ? '' : ' — but no link for these'}`
+      : found.length
+        ? `${found.length} article${found.length === 1 ? '' : 's'} found`
+        : 'nothing could be looked up';
+
+    shotPicker.innerHTML = `
+      <p class="shot-head">${head}</p>
+      ${rows}
+      ${misses ? `<ul class="shot-misses">${misses}</ul>` : ''}
+      <div class="shot-actions">
+        <button type="button" id="shot-save" class="shot-go"${found.length ? '' : ' disabled'}>${alsoFound ? 'add these too' : 'save selected'}</button>
+        <button type="button" id="shot-cancel" class="shot-cancel">${alsoFound ? 'no thanks' : 'cancel'}</button>
+      </div>`;
+    shotPicker.hidden = false;
+    if (!alsoFound) saveStatus.textContent = '';
+
+    $('shot-cancel').addEventListener('click', () => { shotPicker.hidden = true; shotPicker.innerHTML = ''; });
+    $('shot-save').addEventListener('click', async (ev) => {
+      const picked = [...shotPicker.querySelectorAll('[data-shot]')]
+        .filter(box => box.checked)
+        .map(box => found[Number(box.dataset.shot)]);
+      if (!picked.length) return;
+      ev.target.disabled = true;
+      shotPicker.hidden = true;
+      let saved = 0;
+      for (const candidate of picked) if (await saveCandidate(candidate)) saved += 1;
+      if (saved > 1) saveStatus.textContent = `saved ${saved} articles`;
+      shotPicker.innerHTML = '';
+    });
+  }
+
+  $('shot-btn').addEventListener('click', () => shotInput.click());
+  shotInput.addEventListener('change', () => readShot(shotInput.files?.[0]));
+
+  // A screenshot is on the clipboard far more often than it is in a file picker.
+  document.addEventListener('paste', (ev) => {
+    if (reader.hidden === false || document.activeElement === search) return;
+    const file = [...(ev.clipboardData?.files || [])].find(one => /^image\//.test(one.type));
+    if (!file) return;
+    ev.preventDefault();
+    readShot(file);
+  });
+
+  // Only a dragged file is claimed: a dragged link still belongs to the browser.
+  for (const type of ['dragover', 'drop']) {
+    document.addEventListener(type, (ev) => {
+      if (!ev.dataTransfer?.types?.includes('Files')) return;
+      ev.preventDefault();
+      document.body.classList.toggle('is-dropping', type === 'dragover');
+      if (type !== 'drop') return;
+      const file = [...(ev.dataTransfer.files || [])].find(one => /^image\//.test(one.type));
+      if (file) readShot(file);
+    });
+  }
+  document.addEventListener('dragleave', () => document.body.classList.remove('is-dropping'));
+
   // ── reader ───────────────────────────────────────────────────────────────
   async function openReader(id) {
     let a;
@@ -455,9 +715,14 @@
     const note = $('a-note');
     $('reader-rescue').hidden = true;
     $('reader-rescue').innerHTML = '';
-    if (a.quality === 'partial' || a.quality === 'stub') {
+    if (a.quality === 'link' || a.quality === 'partial' || a.quality === 'stub') {
       note.hidden = false;
-      note.innerHTML = `this extraction may be incomplete${a.quality_note ? ' — ' + esc(a.quality_note) : ''}. <button id="note-refetch">try again</button> <button id="note-archive">try archive.today</button>`;
+      // A link saved because the page would not open takes the same two ways
+      // out as a partial one: ask the site again, or ask archive.today.
+      note.innerHTML = (a.quality === 'link'
+        ? `particle could not read this page, so only the link is saved${a.quality_note ? ' — ' + esc(a.quality_note) : ''}.`
+        : `this extraction may be incomplete${a.quality_note ? ' — ' + esc(a.quality_note) : ''}.`)
+        + ` <button id="note-refetch">try again</button> <button id="note-archive">try archive.today</button>`;
       note.querySelector('#note-refetch').addEventListener('click', () => doRefetch(a.id));
       note.querySelector('#note-archive').addEventListener('click', () => startRescue({
         url: a.url, articleId: a.id, mount: $('reader-rescue'), onDone: () => openReader(a.id),
@@ -1938,11 +2203,40 @@
     navigator.serviceWorker.register(appUrl('/sw.js'), { scope: appHome() }).catch(() => {});
   }
   // handle ?add=<url> (PWA share / bookmarklet entry)
-  const addParam = new URLSearchParams(location.search).get('add');
+  const entry = new URLSearchParams(location.search);
+  const addParam = entry.get('add');
   if (addParam) {
     history.replaceState({}, '', appHome());
     urlInput.value = addParam;
     setTimeout(() => form.requestSubmit(), 100);
+  }
+
+  /* A screenshot shared in from another app. The OS hands the file to the
+     service worker, never to the page, so the worker parks it in a cache and
+     sends us here to collect it. */
+  const SHARED_SHOT = 'particle-shared-v1';
+  if (entry.get('shared') === 'screenshot') {
+    history.replaceState({}, '', appHome());
+    caches.open(SHARED_SHOT)
+      .then(async (cache) => {
+        const key = appUrl('/shared-screenshot');
+        const held = await cache.match(key);
+        // Read once and gone, whether or not it survives the next line.
+        await cache.delete(key);
+        if (!held) throw new Error('that shared screenshot went missing');
+        const type = held.headers.get('content-type') || 'image/png';
+        readShot(new File([await held.blob()], 'shared', { type }));
+      })
+      .catch((error) => {
+        saveStatus.textContent = error.message;
+        saveStatus.classList.add('error');
+      });
+  } else if ('caches' in window) {
+    /* A share whose app was closed before it was collected leaves someone's
+       screenshot sitting in this browser's cache. Nothing but the redirect
+       immediately after a share has any business reading it, so any copy still
+       here on an ordinary load is stale and goes. */
+    caches.delete(SHARED_SHOT).catch(() => {});
   }
 
   const bookmarkTarget = `${location.origin}${appHome()}?add=`;

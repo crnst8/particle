@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, extname, join } from 'node:path';
 import { createAuth } from './auth.js';
 import { createDemoSeed, rateLimit } from './demo.js';
-import { extractArticle, normalizeUrl, sanitizeArticleHtml, textFromHtml, BROWSER_UA } from './extract.js';
+import { extractArticle, linkStub, normalizeUrl, sanitizeArticleHtml, textFromHtml, BROWSER_UA } from './extract.js';
 import { findArchiveSnapshot, parseArchiveUrl } from './archive-today.js';
 import { claimTicket, createTicket, readTicket, settleTicket } from './handoff.js';
 import { isLlmConfigured, assessArticle } from './llm.js';
@@ -12,6 +12,8 @@ import { createNarrator } from './narrator.js';
 import { shortlistVoices, toneProfile } from './narration.js';
 import { isTtsConfigured, listVoices, prewarmVoices } from './tts.js';
 import { safeFetch } from './net.js';
+import { log, readScreenshot, screenshotMaxBytes, screenshotReadingEnabled } from './screenshot.js';
+import { isCertain, resolveCandidates } from './resolve.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 4747;
@@ -54,12 +56,16 @@ app.post([api('/extract'), api('/articles'), api('/articles/:id/refetch')],
   express.json({ limit: SNAPSHOT_MAX_BYTES }));
 // The bookmarklet posts cross-origin, so it sends a CORS-simple text body.
 app.post(api('/handoff'), express.text({ limit: SNAPSHOT_MAX_BYTES, type: '*/*' }));
+// A screenshot arrives as its own bytes rather than wrapped in JSON: base64 in
+// a body costs a third again in size, on the one route where size is the cost.
+app.post(api('/screenshot'), express.raw({ type: 'image/*', limit: screenshotMaxBytes }));
 app.use(express.json({ limit: '1mb' }));
 
 // ── API ──────────────────────────────────────────────────────────────────────
 
 app.get(api('/health'), (_req, res) => res.json({
   ok: true, app: 'particle', version: VERSION, demo: DEMO_MODE, narration: Boolean(narrator),
+  screenshots: screenshotReadingEnabled,
 }));
 
 if (DEMO_MODE) {
@@ -74,7 +80,13 @@ if (DEMO_MODE) {
     try {
       res.json(await extractArticle(req.body?.url, pageSource(req.body)));
     } catch (error) {
-      extractionError(res, error);
+      const fallback = linkFallback(req.body);
+      if (!fallback) return extractionError(res, error);
+      try {
+        res.json(linkStub(normalizeUrl(req.body?.url), { ...fallback, note: error.message }));
+      } catch {
+        extractionError(res, error);
+      }
     }
   });
   app.get(api('/demo-seed'), async (_req, res) => res.json(await getDemoSeed()));
@@ -83,6 +95,63 @@ if (DEMO_MODE) {
 } else {
   registerLibraryRoutes(app);
 }
+
+/* A screenshot, read for the article it points at.
+
+   This one only reads and looks up — it files nothing — so it is the same route
+   in demo mode, and a reader can see what particle made of a picture before
+   anything lands in the library. Saving is the ordinary POST /api/articles that
+   follows, with whatever the reader picked.
+
+   It answers in stages rather than at the end. Reading a picture and then
+   asking four archives about it is the slowest thing particle does, and a
+   spinner for a minute is indistinguishable from a hang — so every stage is
+   written out as it happens, one JSON object per line. */
+app.post(api('/screenshot'), DEMO_MODE ? rateLimit({ limit: 6 }) : (_req, _res, next) => next(),
+  async (req, res) => {
+    if (!screenshotReadingEnabled) {
+      return res.status(501).json({ error: 'particle cannot read screenshots: set LLM_API_KEY, or leave OCR on' });
+    }
+    res.type('application/x-ndjson');
+    res.set('Cache-Control', 'no-store');
+    // Proxies that buffer a response would hold every stage back to the end,
+    // which is the one thing this shape exists to avoid.
+    res.set('X-Accel-Buffering', 'no');
+
+    const emit = (event) => res.write(`${JSON.stringify(event)}\n`);
+    const started = Date.now();
+    try {
+      emit({ phase: 'received', kb: Math.round((req.body?.length || 0) / 1024) });
+      const seen = await readScreenshot(req.body, req.get('content-type'),
+        (phase, detail) => emit({ phase, ...detail }));
+      emit({
+        phase: 'read',
+        source: seen.source,
+        titles: seen.candidates.map(one => one.title || one.url),
+      });
+
+      const candidates = await resolveCandidates(seen.candidates, one => emit({
+        phase: 'looked',
+        title: one.title || one.url,
+        found: Boolean(one.url),
+      }));
+      emit({
+        phase: 'done',
+        source: seen.source,
+        poster: seen.poster,
+        ms: Date.now() - started,
+        candidates: candidates.map(one => ({ ...one, certain: isCertain(one) })),
+      });
+      log(`done in ${Date.now() - started}ms`);
+    } catch (error) {
+      const message = error?.code === 'ERR_PRIVATE_ADDRESS'
+        ? error.message
+        : error?.message || 'that screenshot could not be read';
+      log(`failed after ${Date.now() - started}ms — ${message}`, 'error');
+      emit({ phase: 'failed', error: message });
+    }
+    res.end();
+  });
 
 // Where archive.today keeps a snapshot of this article. Answering this needs no
 // captcha, so the browser can fetch the snapshot itself when the server is blocked.
@@ -220,6 +289,11 @@ app.get(pathAt('/manifest.webmanifest'), (_req, res) => {
 app.use(BASE || '/', express.static(pub, { maxAge: '1h', index: false }));
 app.get(BASE ? [BASE, `${BASE}/`] : '/', (_req, res) => res.type('html').send(renderShell()));
 
+/* The PWA share target posts here, and the service worker answers it. This is
+   only reached when no worker is controlling yet — a first launch, or an update
+   swapping over — where opening the app empty-handed beats a 404. */
+app.post(BASE ? [BASE, `${BASE}/`] : '/', (_req, res) => res.redirect(303, `${BASE}/` || '/'));
+
 // SPA fallback: extensionless app routes resolve to the shell; missing files 404.
 app.get(BASE ? `${BASE}/{*path}` : '/{*path}', (req, res, next) => {
   if (req.path.startsWith(api('/')) || extname(req.path)) return next();
@@ -264,22 +338,29 @@ function registerLibraryRoutes(router) {
     // that is the captcha rescue finishing a save that came back partial.
     if (existing && !source.html) return res.json({ ...store.getArticle(existing.id), duplicate: true });
 
-    try {
-      const extracted = await extractArticle(url, source);
+    const file = (extracted, status) => {
       // A short-code snapshot resolves to the story's own URL, which may already be filed.
       const filed = extracted.url === url ? existing : store.getByUrl(extracted.url);
       if (filed) {
         const updated = store.replaceArticleContent(filed.id, extracted);
         res.json(withChallenge(updated, extracted));
-        if (isLlmConfigured) enrichInBackground(filed.id);
-        return;
+        return filed.id;
       }
       const saved = store.insertArticle(extracted);
       if (extracted.quality_note) store.updateArticle(saved.id, { quality_note: extracted.quality_note });
-      res.status(201).json(withChallenge(store.getArticle(saved.id), extracted));
-      if (isLlmConfigured) enrichInBackground(saved.id);
+      res.status(status).json(withChallenge(store.getArticle(saved.id), extracted));
+      return saved.id;
+    };
+
+    try {
+      const id = file(await extractArticle(url, source), 201);
+      if (isLlmConfigured) enrichInBackground(id);
     } catch (error) {
-      extractionError(res, error);
+      // A link the reader found is worth keeping even when the page will not be
+      // read — that is the whole of what a screenshot recovered.
+      const fallback = linkFallback(req.body);
+      if (!fallback) return extractionError(res, error);
+      file(linkStub(url, { ...fallback, note: error.message }), 201);
     }
   });
 
@@ -552,6 +633,23 @@ function pageSource(body) {
   const html = typeof body?.html === 'string' && body.html.trim() ? body.html : undefined;
   const sourceUrl = typeof body?.source_url === 'string' ? body.source_url : undefined;
   return html ? { html, sourceUrl } : {};
+}
+
+/* What the reader knows about an article whose page would not open — read off a
+   screenshot, and worth filing under even when nothing else could be. Absent
+   means the caller wants the failure, not a stub. */
+function linkFallback(body) {
+  if (!body || body.link_fallback === undefined || body.link_fallback === null) return null;
+  const meta = typeof body.link_fallback === 'object' ? body.link_fallback : {};
+  const text = value => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 400) : null);
+  return {
+    title: text(meta.title),
+    byline: text(meta.byline),
+    site_name: text(meta.site_name),
+    excerpt: text(meta.excerpt),
+    published_at: text(meta.published_at),
+    fetch_method: 'screenshot',
+  };
 }
 
 function handoffCors(res) {

@@ -465,6 +465,44 @@ function plainTextToHtml(source) {
     + '</article></body></html>';
 }
 
+/* An article that could not be read, kept anyway as a link.
+
+   A screenshot resolves to a real URL far more often than that URL will hand
+   over its text — a hard paywall, a login wall, a DOI landing page. Losing the
+   link at that point throws away the whole find, so it is filed with whatever
+   the picture said about it and marked for what it is. Re-fetching it later is
+   the ordinary refetch, and rewrites this in place if the site ever relents. */
+export function linkStub(url, meta = {}) {
+  const site = meta.site_name || hostLabel(url);
+  const title = meta.title || site || url;
+  const escape = text => String(text).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const note = meta.note ? `<p>${escape(meta.note)}</p>` : '';
+  const excerpt = meta.excerpt ? `<blockquote><p>${escape(meta.excerpt)}</p></blockquote>` : '';
+  const text = [title, meta.byline, site, meta.excerpt].filter(Boolean).join('. ');
+
+  return {
+    url,
+    canonical_url: url,
+    title,
+    byline: meta.byline || null,
+    site_name: site,
+    excerpt: (meta.excerpt || `saved as a link — ${site}`).slice(0, 300),
+    content_html: `<article><p>particle could not read this one, so it is saved as a link.</p>`
+      + `${excerpt}${note}<p><a href="${escape(url)}">open the original →</a></p></article>`,
+    text_content: text,
+    word_count: 0,
+    lead_image: null,
+    published_at: meta.published_at || null,
+    quality: 'link',
+    quality_note: meta.note || 'saved as a link; the page could not be read',
+    fetch_method: meta.fetch_method || 'link',
+  };
+}
+
+function hostLabel(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return null; }
+}
+
 export function normalizeUrl(input) {
   let u = String(input || '').trim();
   if (!u) throw new Error('Empty URL');

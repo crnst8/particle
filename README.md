@@ -121,6 +121,79 @@ database; set `OCR_LANG_PATH` to a local directory for an air-gapped install.
 article is saved and marked partial rather than holding the queue. Set
 `OCR_ENABLED=0` to switch it off, and a scan then fails instead of being read.
 
+### Saving from a screenshot
+The reader is in TikTok, a video mentions an article, and a screenshot is the
+only thing that comes with them. Hand particle the picture — the 🖼 button, a
+paste, a drag, or the system share sheet on Android — and it works out what the
+picture refers to and saves the article itself.
+
+Reading the picture is one call to a vision model (`SCREENSHOT_MODEL`, over the
+same OpenAI-compatible endpoint as tagging). It is asked to separate the article
+from the app around it — the status bar, "Find related content", like counts,
+the comment box — and to report what it can read: title, deck, masthead, byline,
+date, and any domain legible on screen. It is asked **not** to guess a URL,
+because a guessed URL looks exactly like a real one and 404s.
+
+Finding the link costs nothing. The publishing platforms answer questions about
+their own archives for free, so particle asks them in order:
+
+1. a URL or bare domain legible in the picture
+2. that publication's archive — Substack's `?search=`, or WordPress search
+3. the masthead spelled as an address (*Elevated It Girl* → `elevateditgirl`)
+4. **who the author is**, which is the route that survives a newsletter whose
+   name and address share no letters — *mindbox* publishes at
+   `contemplationstation.substack.com`, and the TikTok handle is frequently the
+   Substack handle
+5. Crossref, when the picture is a paper's title page
+
+Nothing is accepted on a name alone. `theculturist.substack.com` is a real
+publication of exactly that name holding none of these articles, and
+`mymusings.substack.com` was abandoned in 2020 — so a candidate is only saved
+when its **title, date and byline agree** with what the picture said. Guessing
+wrong is worse than not finding it.
+
+**When it just saves, and when it asks.** A find is *certain* when the title
+matched outright **and** something else the picture said matched too — the date,
+the byline, or a domain that was legible on screen rather than guessed from a
+name. One agreement is a coincidence a common title can manage; two independent
+ones is the article. A certain find is filed without asking, and anything else
+the picture named is offered underneath the confirmation rather than standing in
+the way of it. Only when nothing is certain does the picker ask first.
+
+**It answers in stages.** Reading a picture and then asking several archives
+about it is the slowest thing particle does, so the route streams a line per
+stage — uploaded, reading, read, each lookup as it lands. For as long as it
+runs, the URL field steps aside and the progress takes its place: which stage,
+how long it has been, and a cancel. There is nothing to type into that field
+while it waits, and a status that has not moved for forty seconds reads as a
+hang whether or not it is one.
+
+**Speed.** The picture is re-encoded before it is sent: a phone screenshot is a
+lossless PNG of a photograph, which is the worst case for PNG, and JPEG at the
+same resolution is five to eight times smaller (2.8MB → 417KB for one of these).
+Nothing is resampled at phone sizes — the small grey type carrying a domain is
+exactly what a resize destroys — only pictures genuinely larger than a phone's
+come down to fit. Lookups run in parallel, and only the surest few candidates
+are looked up at all.
+
+**If the link is found but the page will not open** — a hard paywall, a DOI
+landing page — the article is saved as a *link*: its real title, byline and
+publication from the picture, marked `link` in the list, with the same "try
+again / try archive.today" recovery a partial extraction gets.
+
+Without `LLM_API_KEY` this falls back to OCR, which reads the headline and
+little else: the small grey type carrying the domain is exactly what Tesseract
+loses. The screenshot itself is never stored — it is read, discarded, and the
+article saved from its own URL.
+
+**What leaves your machine.** With a key set, the whole picture is sent to
+whatever `LLM_API_URL` points at. A phone screenshot is not only the article: it
+carries the status bar, the time, any notification on screen, and whatever else
+was open behind it. Point it at a provider you would send that to, or leave the
+key unset and stay on local OCR. Nothing is written to disk at any point, the
+library stores the article and not the picture, and the resolvers afterwards
+send only a title — never the image — to the archives they ask.
+
 ### archive.today snapshots
 - Paste an `archive.is/…` link and particle reads that capture, filing it under
   the original article's URL so it dedupes against the story itself.
@@ -292,6 +365,16 @@ next to the compose file — see [`.env.example`](.env.example).
 | `LLM_API_KEY` | unset | API key for the optional tagging/quality pass. Unset = feature off |
 | `LLM_API_URL` | OpenCode Zen | Any OpenAI-compatible `/chat/completions` URL — Ollama, OpenRouter, whatever you run |
 | `LLM_MODEL` | `deepseek-v4-flash` | Model name for the above |
+| `SCREENSHOT_MODEL` | `glm-5.3-flash` | Vision model used to read screenshots. Named separately because the tagging model is usually text-only |
+| `SCREENSHOT_MAX_BYTES` | `12582912` | Largest screenshot accepted in one upload |
+| `RESOLVE_MAX_HOSTS` | `6` | Addresses guessed from a name before giving up |
+| `RESOLVE_PROFILE_LOOKUPS` | `3` | People asked where they publish |
+| `RESOLVE_MAX_CANDIDATES` | `4` | Articles from one picture worth looking up |
+| `RESOLVE_TIMEOUT_MS` | `12000` | Timeout on one archive lookup |
+| `SCREENSHOT_SEND_EDGE` | `1280` | Short edge above which a screenshot is scaled down before being sent |
+| `SCREENSHOT_SEND_LONG_EDGE` | `2880` | Long edge, same |
+| `SCREENSHOT_SEND_QUALITY` | `85` | JPEG quality for the copy sent to the model |
+| `SCREENSHOT_LOG` | `1` | Set to `0` to silence the per-stage screenshot log (failures still log) |
 | `TTS_API_KEY` | unset | API key for narration. Unset = feature off. A free [Fish Audio](https://fish.audio) key works |
 | `TTS_API_URL` | Fish Audio | Text-to-speech endpoint |
 | `TTS_MODEL` | `s2.1-pro-free` | Voice model sent in the `model` header |
@@ -321,6 +404,45 @@ docker run -d --name particle -p 4747:4747 -v particle-data:/app/data \
   -e PARTICLE_PASSWORD='use-a-long-password' \
   ghcr.io/crnst8/particle:latest
 ```
+
+## Logs
+
+Every stage of a screenshot save is logged with a timestamp and how long it took,
+so a slow one can be blamed on the right thing — the model, the lookups, or the
+article itself:
+
+```
+2026-09-03 12:38:30 [screenshot] read 348KB in 4120ms → 3 candidate(s)
+2026-09-03 12:38:31 [screenshot] "The slow media movement…" → https://elevateditgirl.substack.com/p/… (680ms, elevateditgirl.substack.com archive, title+date+byline)
+2026-09-03 12:38:32 [screenshot] done in 5768ms
+```
+
+```sh
+./dev.sh logs                 # follow everything
+./dev.sh logs screenshot      # follow one subject
+docker compose logs -f particle          # the same, without dev.sh
+docker logs --since 1h particle          # on a live container
+```
+
+The container's log is capped at two 10MB files, so it cannot fill a disk.
+`SCREENSHOT_LOG=0` silences the running commentary; failures still log.
+
+## Keeping the secrets in one place
+
+`.env` is the only file that holds anything private, and it stays on the host:
+
+- it is in `.gitignore`, in `.dockerignore`, and in `.publishignore` — three
+  separate locks, and `./publish.sh check` fails the release if it is ever
+  tracked. It has never been committed
+- the image does not contain it. The Dockerfile copies `server/ public/
+  landing/ demo/` and nothing else; there is no `.env` anywhere in the image
+- compose reads it host-side and passes the values in as environment variables,
+  so it is never mounted into the container
+- `chmod 600 .env` on any machine with more than one account on it. Anyone who
+  can run `docker inspect particle` can read those values back, which is the
+  normal trade for `env_file` — keep docker group membership tight
+- logs redact anything key-shaped before writing, because some providers take
+  their key in the query string and echo the request back in an error
 
 ## Data storage 
 

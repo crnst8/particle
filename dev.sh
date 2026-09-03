@@ -52,6 +52,14 @@ case "${1:-}" in
   status)
     if is_ours; then log "running — http://localhost:$PORT"; else log "not running"; fi
     ;;
-  logs) docker compose logs -f particle ;;
-  *) echo "usage: ./dev.sh {start|stop|restart|status|logs}" >&2; exit 2 ;;
+  # ./dev.sh logs            → follow everything
+  # ./dev.sh logs screenshot  → follow only lines mentioning screenshots
+  logs)
+    if [[ -n "${2:-}" ]]; then
+      docker compose logs -f --tail 200 particle | grep --line-buffered -i "$2"
+    else
+      docker compose logs -f --tail 200 particle
+    fi
+    ;;
+  *) echo "usage: ./dev.sh {start|stop|restart|status|logs [filter]}" >&2; exit 2 ;;
 esac

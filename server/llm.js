@@ -3,26 +3,113 @@
 const API = process.env.LLM_API_URL || process.env.OPENCODE_API || 'https://opencode.ai/zen/go/v1/chat/completions';
 const KEY = process.env.LLM_API_KEY || process.env.OPENCODE_KEY || '';
 const MODEL = process.env.LLM_MODEL || process.env.OPENCODE_MODEL || 'deepseek-v4-flash';
+/* The tagging model is text-only, so reading a picture needs a second name.
+   Kept separate rather than inferred: a lineup changes under you, and a
+   text-only model handed an image fails by describing nothing rather than
+   by erroring. */
+const VISION_MODEL = process.env.SCREENSHOT_MODEL || 'glm-5.3-flash';
 
 export const isLlmConfigured = Boolean(KEY);
 
-async function chat(messages, { maxTokens = 300 } = {}) {
+async function chat(messages, { maxTokens = 300, model = MODEL, timeout = 45000 } = {}) {
   if (!KEY) throw new Error('LLM_API_KEY not set');
   const res = await fetch(API, {
     method: 'POST',
-    signal: AbortSignal.timeout(45000),
+    signal: AbortSignal.timeout(timeout),
     headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: MODEL, messages, max_tokens: maxTokens, temperature: 0 }),
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0 }),
   });
   if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content || '';
 }
 
-function parseJsonLoose(text) {
-  const m = text.match(/\{[\s\S]*\}/);
-  if (!m) throw new Error('no JSON in LLM reply');
-  return JSON.parse(m[0]);
+/* Models answer with JSON the way people answer with a straight yes: mostly.
+   A fence around it, a sentence in front, a thought that itself contains a
+   brace, or — the one that actually bites — a reply that ran out of tokens
+   halfway through the last object. Each of those is recoverable and worth
+   recovering: the alternative is throwing away an answer the model did give. */
+export function parseJsonLoose(text) {
+  const body = String(text ?? '').replace(/```(?:json)?\s*|\s*```/gi, '').trim();
+  try {
+    return JSON.parse(body);
+  } catch { /* it is rarely this easy */ }
+
+  const start = body.indexOf('{');
+  if (start < 0) throw new Error('no JSON in LLM reply');
+
+  // The first balanced object from there, ignoring braces inside strings —
+  // a greedy match to the last brace swallows any prose that follows it.
+  const balanced = firstObject(body, start);
+  if (balanced) {
+    try {
+      return JSON.parse(balanced);
+    } catch { /* balanced but still malformed */ }
+  }
+
+  // Nothing balanced means the reply was cut off. Close what is open and keep
+  // whatever objects did finish, rather than losing the lot to the last one.
+  try {
+    return JSON.parse(closeTruncated(body.slice(start)));
+  } catch {
+    throw new Error(`could not parse the reply as JSON (${body.length} chars)`);
+  }
+}
+
+function firstObject(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ']') {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/* Drop the half-written tail, then close every bracket still open. */
+function closeTruncated(text) {
+  const open = [];
+  let inString = false;
+  let escaped = false;
+  let lastComplete = -1;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{' || ch === '[') open.push(ch === '{' ? '}' : ']');
+    else if (ch === '}' || ch === ']') {
+      open.pop();
+      // an element of the outer array finished cleanly here
+      if (open.length === 2) lastComplete = i;
+    }
+  }
+  const body = lastComplete >= 0 ? text.slice(0, lastComplete + 1) : text.replace(/,\s*[^,]*$/, '');
+  const stillOpen = [];
+  let depth = 0;
+  inString = false;
+  escaped = false;
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') { stillOpen.push('}'); depth += 1; }
+    else if (ch === '[') { stillOpen.push(']'); depth += 1; }
+    else if (ch === '}' || ch === ']') { stillOpen.pop(); depth -= 1; }
+  }
+  return body + stillOpen.reverse().join('');
 }
 
 /**
@@ -129,5 +216,84 @@ Reply with JSON only:
     intro: parsed.intro,
     pronunciations: parsed.pronunciations,
     reason: parsed.reason,
+  };
+}
+
+/**
+ * Read a screenshot for the article (or articles) it points at. The picture is
+ * usually a social post — a video with a page held up behind it, or a link card
+ * — so most of what is legible is the app's own furniture rather than the piece
+ * the reader wanted. The model is asked to separate the two and to name what it
+ * sees, not to guess a URL: guessed URLs look right and 404, and the resolvers
+ * downstream find real ones from these fields.
+ * Returns { candidates: [...] }; the caller validates every field.
+ */
+export async function readArticleReferences({ image, mime }) {
+  const reply = await chat([
+    {
+      role: 'system',
+      content: 'You read screenshots for a read-later app and report the articles they refer to. '
+        + 'You transcribe what is written; you never invent a URL, a date or an author. '
+        + 'Respond with strict JSON, nothing else.',
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:${mime};base64,${image}` } },
+        {
+          type: 'text',
+          text: `This is a phone screenshot, usually of a social app (TikTok, Instagram, Reddit, X).
+Somewhere in it a written article is being referred to — a page filmed behind the speaker, a
+newsletter email, a link card, a PDF, or a title named in the caption.
+
+Ignore the app's own furniture. None of this is ever part of an article:
+the status bar (clock, battery, wifi), "Find related content", "Search", "SHARE",
+"SUBSCRIBE", "Listen", "Repost to followers", "Add comment…", "more", "Effect · Green Screen",
+"Playlist", like/comment/bookmark counts, follower counts, page indicators like "3 / 4",
+the poster's handle and the date they posted, and menu or navigation words.
+
+Report every distinct article the screenshot refers to, including ones that are only named in
+the caption and not shown. For each one give what is actually legible and null for the rest:
+
+- title: the article's headline, transcribed exactly, capitalisation and all
+- subtitle: the standfirst or deck beneath it, if any
+- publication: the masthead or newsletter name (e.g. "Vogue Business", "THE CULTURIST", "mindbox")
+- byline: the author's name as written on the article itself, not the social poster's handle
+- published: the article's own date, as an ISO date (YYYY-MM-DD) when you can read one
+- url: only if a full URL is legible somewhere in the picture
+- domain: only if a bare domain is legible (e.g. "conquer1.substack.com"), lowercased
+- kind: "article" for journalism or a blog post, "newsletter" for Substack-shaped email or link
+  cards, "paper" for an academic paper with authors and institutions, "unknown" otherwise
+- excerpt: the first sentence or two of body text, if any is legible
+- confidence: 0 to 1, how sure you are this is a real article reference
+
+Also report:
+- poster: the social account's display name or handle, if visible. It is often the same person
+  as the byline, so it is worth having even though it is not part of the article.
+
+Report at most 4 articles, the clearest first, and keep every field short. Do not explain
+your reasoning; the JSON is the whole answer.
+
+Reply with JSON only:
+{"poster":"...","candidates":[{"title":"...","subtitle":null,"publication":"...","byline":null,"published":null,"url":null,"domain":null,"kind":"newsletter","excerpt":null,"confidence":0.9}]}`,
+        },
+      ],
+    },
+    // Vision models spend tokens on the picture before a word of JSON appears,
+    // and a caption listing four articles is four objects long. Under-budget it
+    // and the reply is cut off mid-object, which used to lose the whole answer.
+  ], { maxTokens: 4000, model: VISION_MODEL, timeout: 90_000 });
+
+  let parsed;
+  try {
+    parsed = parseJsonLoose(reply);
+  } catch (error) {
+    // The reply itself is the only evidence of why a read came back empty.
+    error.reply = String(reply || '').slice(0, 400);
+    throw error;
+  }
+  return {
+    poster: typeof parsed.poster === 'string' ? parsed.poster : null,
+    candidates: Array.isArray(parsed.candidates) ? parsed.candidates : [],
   };
 }

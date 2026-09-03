@@ -260,7 +260,11 @@
 
   // Page source the browser fetched itself — the archive.today captcha rescue.
   function sourceBody(source) {
-    return source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {};
+    return {
+      ...(source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {}),
+      // What a screenshot said about an article whose page may not open at all.
+      ...(source?.linkFallback ? { link_fallback: source.linkFallback } : {}),
+    };
   }
 
   // A block boundary is a word boundary; textContent alone would run the last

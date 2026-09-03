@@ -15,6 +15,13 @@ services:
     volumes:
       - particle-data:/app/data
     restart: unless-stopped
+    # Without this the container's log file grows until the disk does not. Two
+    # 10MB files is days of an ordinary library and survives a `docker logs`.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
 
 volumes:
   particle-data:
