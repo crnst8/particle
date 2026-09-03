@@ -187,11 +187,12 @@ export function insertArticle(a) {
 export function replaceArticleContent(id, a) {
   db.prepare(`
     UPDATE articles SET canonical_url=?, title=?, byline=?, site_name=?, excerpt=?, content_html=?,
-      text_content=?, word_count=?, lead_image=?, published_at=?, quality=?, quality_note=NULL,
+      text_content=?, word_count=?, lead_image=?, published_at=?, quality=?, quality_note=?,
       fetch_method=?, edited_at=NULL
     WHERE id=?
   `).run(a.canonical_url, a.title, a.byline, a.site_name, a.excerpt, a.content_html,
-    a.text_content, a.word_count, a.lead_image, a.published_at, a.quality ?? null, a.fetch_method, id);
+    a.text_content, a.word_count, a.lead_image, a.published_at, a.quality ?? null,
+    a.quality_note ?? null, a.fetch_method, id);
   return getArticle(id);
 }
 

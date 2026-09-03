@@ -82,6 +82,24 @@ npm start
 - Keeps the longest available version if all sources are truncated.
 - Flags incomplete articles as **partial**.
 - Supports one-click re-extraction.
+- Reads PDFs too — see below.
+
+### PDFs
+Paste a PDF link like any other article. A PDF is detected by its bytes rather
+than its URL, so a link served as `application/octet-stream` still works, and
+the same fallbacks (direct, Googlebot, Wayback) apply.
+
+A PDF carries no structure — only glyphs at coordinates — so particle rebuilds
+it: columns are read one at a time, wrapped lines rejoin into paragraphs, words
+broken across a line put themselves back together, headings are recovered from
+type size and placement, and running heads and page numbers are dropped instead
+of interrupting a sentence. The title comes from the PDF's metadata only when
+the document actually prints it; otherwise it is taken from the largest type on
+page one. The result is sanitised and stored exactly like a scraped page.
+
+A scanned PDF with no text layer is refused rather than saved empty — it needs
+OCR, which particle does not do. Images inside a PDF are not extracted.
+`PDF_MAX_BYTES` and `PDF_MAX_PAGES` bound the work; see `.env.example`.
 
 ### archive.today snapshots
 - Paste an `archive.is/…` link and particle reads that capture, filing it under

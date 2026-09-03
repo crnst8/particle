@@ -6,9 +6,15 @@ import {
   ArchiveChallengeError, fetchAnyMirror, findArchiveSnapshot,
   parseArchiveUrl, stripArchiveChrome,
 } from './archive-today.js';
+import { isPdfBytes, looksLikePdfUrl, readPdf } from './pdf.js';
 
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const GOOGLEBOT_UA = 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/126.0.0.0 Safari/537.36';
+
+// A PDF is downloaded whole before it can be parsed, so it needs a ceiling.
+const PDF_MAX_BYTES = positiveInt(process.env.PDF_MAX_BYTES, 25 * 1024 * 1024);
+// A PDF is a document, not a page: these three fetch it, the rest only serve markup.
+const HTML_ONLY_STRATEGIES = new Set(['amp', 'archive.today']);
 
 const PAYWALL_MARKERS = [
   'subscribe to continue', 'subscribe to read', 'subscription required', 'to continue reading',
@@ -21,7 +27,7 @@ class FetchError extends Error {
   constructor(message, status) { super(message); this.status = status; }
 }
 
-async function fetchHtml(url, { ua, referer, timeout = 20000 } = {}) {
+async function fetchDocument(url, { ua, referer, timeout = 20000 } = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
@@ -37,12 +43,43 @@ async function fetchHtml(url, { ua, referer, timeout = 20000 } = {}) {
     });
     if (!res.ok) throw new FetchError(`HTTP ${res.status}`, res.status);
     const ct = res.headers.get('content-type') || '';
-    if (ct && !/html|xml|text/i.test(ct)) throw new FetchError(`Not HTML (${ct})`);
-    const html = await res.text();
-    return { html, finalUrl: res.url || url };
+    const finalUrl = res.url || url;
+    if (ct && /html|xml|text/i.test(ct) && !/pdf/i.test(ct)) {
+      return { html: await res.text(), finalUrl };
+    }
+    // Anything else may still be a PDF announced badly — application/octet-stream,
+    // or no type at all — so the bytes decide. A type that could not be one is
+    // still rejected on the header, without downloading the body.
+    if (ct && !/pdf|octet-stream|binary|download/i.test(ct) && !looksLikePdfUrl(finalUrl)) {
+      throw new FetchError(`Not HTML (${ct})`);
+    }
+    const bytes = await readCapped(res, PDF_MAX_BYTES);
+    if (isPdfBytes(bytes)) return { pdf: bytes, finalUrl };
+    if (ct) throw new FetchError(`Not HTML (${ct})`);
+    return { html: new TextDecoder().decode(bytes), finalUrl };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function readCapped(res, limit) {
+  const advertised = Number(res.headers.get('content-length'));
+  const tooBig = () => new FetchError(`document is larger than ${Math.round(limit / 1048576)}MB`);
+  if (Number.isFinite(advertised) && advertised > limit) throw tooBig();
+  if (!res.body) return Buffer.alloc(0);
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of res.body) {
+    bytes += chunk.byteLength;
+    if (bytes > limit) throw tooBig();
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function parseDom(html, url) {
@@ -194,6 +231,57 @@ function parseAttempt(html, url, method, { preclean } = {}) {
   };
 }
 
+/* The PDF twin of parseAttempt: a different reader in the middle, the same
+   sanitising, the same rewriting, the same quality verdict on the way out. */
+async function parsePdfAttempt(bytes, url, method) {
+  let doc;
+  try {
+    doc = await readPdf(bytes);
+  } catch (error) {
+    return { ok: false, reason: error.message, meta: {} };
+  }
+
+  const text = (doc.text || '').trim();
+  const wordCount = text ? text.split(/\s+/).length : 0;
+  // Glyphs are the only thing a PDF is obliged to carry. A scan carries none,
+  // and no amount of retrying elsewhere will produce them.
+  if (!wordCount) {
+    return { ok: false, meta: {}, reason: `no text layer in ${doc.pageCount} page(s) — a scan, so it needs OCR` };
+  }
+
+  const paywallReason = looksPaywalled(text, wordCount);
+  const notes = [];
+  if (doc.truncated) notes.push(`only part of this ${doc.pageCount}-page PDF was read`);
+
+  return {
+    ok: !paywallReason,
+    reason: paywallReason,
+    meta: {},
+    result: {
+      title: doc.title || titleFromPath(url),
+      byline: doc.byline,
+      site_name: new URL(url).hostname.replace(/^www\./, ''),
+      excerpt: text.slice(0, 300).trim(),
+      content_html: rewriteContent(sanitize(doc.html), url),
+      text_content: text,
+      word_count: wordCount,
+      lead_image: null,
+      published_at: doc.publishedAt,
+      canonical_url: url,
+      fetch_method: `${method} (pdf)`,
+      ...(notes.length ? { quality_note: notes.join('; ') } : {}),
+    },
+  };
+}
+
+// A PDF that names itself nothing is at least named by the link that reached it.
+function titleFromPath(url) {
+  let name = '';
+  try { name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || ''); } catch { /* keep url */ }
+  name = name.replace(/\.pdf$/i, '').replace(/[_+-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return name || url;
+}
+
 async function waybackLookup(url) {
   const api = 'https://archive.org/wayback/available?url=' + encodeURIComponent(url);
   const res = await safeFetch(api, { signal: AbortSignal.timeout(15000) });
@@ -231,13 +319,13 @@ export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
   ] : [
     // A pasted archive.is link is an explicit request: honour it before anything else.
     ...(pasted ? [{ name: 'archive.today', run: () => archiveAttempt(pasted.snapshotUrl) }] : []),
-    { name: 'direct', run: () => fetchHtml(url) },
-    { name: 'googlebot', run: () => fetchHtml(url, { ua: GOOGLEBOT_UA, referer: 'https://www.google.com/' }) },
+    { name: 'direct', run: () => fetchDocument(url) },
+    { name: 'googlebot', run: () => fetchDocument(url, { ua: GOOGLEBOT_UA, referer: 'https://www.google.com/' }) },
     {
       name: 'amp',
       run: async () => {
         if (!ampUrl) throw new FetchError('no AMP version advertised');
-        return fetchHtml(ampUrl, { ua: GOOGLEBOT_UA });
+        return fetchDocument(ampUrl, { ua: GOOGLEBOT_UA });
       },
     },
     {
@@ -246,10 +334,10 @@ export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
         const snapUrl = await waybackLookup(url);
         if (!snapUrl) throw new FetchError('no wayback snapshot');
         try {
-          return await fetchHtml(snapUrl, { ua: false, timeout: 30000 });
+          return await fetchDocument(snapUrl, { ua: false, timeout: 30000 });
         } catch {
           // some snapshots refuse the raw id_ variant; the toolbar version still parses
-          return fetchHtml(snapUrl.replace('id_/', '/'), { ua: false, timeout: 30000 });
+          return fetchDocument(snapUrl.replace('id_/', '/'), { ua: false, timeout: 30000 });
         }
       },
     },
@@ -263,11 +351,17 @@ export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
     }]),
   ];
 
+  let isPdf = looksLikePdfUrl(url);
+
   for (const strat of strategies) {
+    if (isPdf && HTML_ONLY_STRATEGIES.has(strat.name)) continue;
     try {
-      const { html: body, finalUrl, preclean } = await strat.run();
+      const { html: body, pdf, finalUrl, preclean } = await strat.run();
       const base = strat.name === 'wayback' ? url : finalUrl;
-      const attempt = parseAttempt(body, base, strat.name, { preclean });
+      if (pdf) isPdf = true;
+      const attempt = pdf
+        ? await parsePdfAttempt(pdf, base, strat.name)
+        : parseAttempt(body, base, strat.name, { preclean });
       if (attempt.meta?.ampUrl && !ampUrl) {
         try { ampUrl = new URL(attempt.meta.ampUrl, finalUrl).href; } catch { /* bad amp href */ }
       }
