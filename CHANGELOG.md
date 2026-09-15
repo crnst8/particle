@@ -1,3 +1,8 @@
+## 1.3.4 — 2026-09-15
+
+- chore: cleanup
+- fix: reading state + tagging fix
+
 ## 1.3.3 — 2026-09-03
 
 - feat: screenshot link extraction (beta)
