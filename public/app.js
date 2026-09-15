@@ -104,6 +104,8 @@
     deleteCollection: (id) => fetchJson(`/api/collections/${id}`, { method: 'DELETE' }),
     setArticleCollection: (id, collectionId, member) =>
       fetchJson(`/api/articles/${id}/collections/${collectionId}`, { method: 'PUT', body: { member } }),
+    tagging: () => fetchJson('/api/tagging'),
+    tagUntagged: () => fetchJson('/api/tagging', { method: 'POST', body: {} }),
   };
   const api = DEMO
     ? window.createParticleLocalStore({ fetchJson, maxArticles: DEMO_MAX })
@@ -388,8 +390,8 @@
         saveStatus.classList.remove('ok');
       }, 4000);
       refresh();
-      // tags arrive async from enrichment; refresh once more
-      if (!DEMO) setTimeout(refresh, 9000);
+      // tags arrive async from enrichment; a reasoning model can take a while
+      if (!DEMO) { setTimeout(refresh, 9000); setTimeout(refresh, 30000); }
     } catch (e) {
       if (DEMO && e.message.startsWith('demo limit reached')) {
         saveStatus.innerHTML = `${esc(e.message)} · <a href="https://github.com/crnst8/particle">self-host without a limit →</a>`;
@@ -2000,6 +2002,7 @@
     sheet.hidden = false;
     syncSettings();
     renderSettingsLists();
+    renderTagging();
     sheet.querySelector('.sheet-x').focus();
   }
 
@@ -2065,6 +2068,75 @@
     if (!swatch) return;
     prefs.accent = swatch.dataset.value;
     syncSettings();
+  });
+
+  // ── tagging ──────────────────────────────────────────────────────────────
+  // Tags arrive on save, from the server's LLM pass. Articles saved before a key
+  // was set, or while the provider was down, never get them, and until now the
+  // only way to tell "no key" from "key, but failing" was the server log. This
+  // says which it is, and offers to fill the holes. Demo mode has no server
+  // library and no key, so the section stays hidden there. A run outlives the
+  // sheet: polling carries on behind a closed sheet so the library repaints
+  // with the new tags when it finishes.
+  let taggingTimer = null;
+
+  function stopTaggingWatch() {
+    clearTimeout(taggingTimer);
+    taggingTimer = null;
+  }
+
+  async function renderTagging() {
+    if (DEMO) return;
+    const section = $('set-tagging');
+    section.hidden = false;
+    try {
+      paintTagging(await api.tagging());
+    } catch (e) {
+      paintTagging({ enabled: false, error: e.message });
+    }
+  }
+
+  function paintTagging(status) {
+    const line = $('set-tag-state'), note = $('set-tag-note'), run = $('set-tag-run');
+    line.classList.toggle('is-off', !status.enabled);
+    line.classList.toggle('is-error', Boolean(status.error) && !status.running);
+    run.hidden = !status.enabled;
+    run.disabled = status.running || !status.untagged;
+    stopTaggingWatch();
+
+    if (!status.enabled) {
+      line.textContent = 'off';
+      note.textContent = 'Set LLM_API_KEY on the server and restart to tag articles as they are saved.';
+      return;
+    }
+    if (status.running) {
+      const reached = status.done + status.failed;
+      line.textContent = `tagging ${reached + 1 > status.total ? status.total : reached + 1} of ${status.total}…`;
+      note.textContent = status.failed ? `${status.failed} failed so far${status.error ? `: ${status.error}` : ''}` : '';
+      taggingTimer = setTimeout(async () => {
+        try { paintTagging(await api.tagging()); } catch { /* the next open will ask again */ }
+        // a finished run has changed rows the library is showing
+        if (!taggingTimer) refresh();
+      }, 1500);
+      return;
+    }
+    line.textContent = status.untagged
+      ? `${status.untagged} article${status.untagged === 1 ? '' : 's'} untagged`
+      : 'every article is tagged';
+    if (status.finished_at && status.total) {
+      note.textContent = `tagged ${status.done} of ${status.total}`
+        + (status.failed ? `, ${status.failed} failed${status.error ? `: ${status.error}` : ''}` : '.');
+    } else if (status.error) note.textContent = `last attempt failed: ${status.error}`;
+    else note.textContent = '';
+  }
+
+  $('set-tag-run').addEventListener('click', async () => {
+    $('set-tag-run').disabled = true;
+    try {
+      paintTagging(await api.tagUntagged());
+    } catch (e) {
+      paintTagging({ enabled: true, untagged: 0, error: e.message });
+    }
   });
 
   // ── lists ────────────────────────────────────────────────────────────────

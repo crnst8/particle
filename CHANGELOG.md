@@ -13,6 +13,17 @@ requires LLM key
 
 ## Unreleased
 
+- feat: settings shows whether tagging is on, how many articles have no tags,
+  and a button that tags them — a library saved before the key was set no
+  longer has to be re-saved article by article. A failing provider is reported
+  there too; it used to be indistinguishable from one never configured
+- fix: OpenCode Go began refusing requests that carry no `x-opencode-session`,
+  which silently turned tagging, casting and screenshot reading off for anyone
+  on the default endpoint. Every call now carries one, and identifies itself
+- fix: the screenshot progress row — spinner, "reading…", cancel — showed on
+  every page load, next to the URL field, whether or not a screenshot was being
+  read. Its `display: flex` overrode the `hidden` attribute
+
 - feat: save an article from a screenshot of it. Hand particle a picture — the
   TikTok that mentioned the piece, a newsletter in someone's inbox, a paper's
   title page — and it reads what the picture refers to and looks the article up

@@ -65,7 +65,7 @@ app.use(express.json({ limit: '1mb' }));
 
 app.get(api('/health'), (_req, res) => res.json({
   ok: true, app: 'particle', version: VERSION, demo: DEMO_MODE, narration: Boolean(narrator),
-  screenshots: screenshotReadingEnabled,
+  screenshots: screenshotReadingEnabled, tagging: isLlmConfigured,
 }));
 
 if (DEMO_MODE) {
@@ -377,6 +377,19 @@ function registerLibraryRoutes(router) {
     }
   });
 
+  /* Tagging happens on save, so a library that predates the key, or outlived a
+     provider outage, has holes in it. This is the one way to fill them without
+     re-saving: what is untagged, and a button that tags it. The run is answered
+     immediately and watched by polling; the sheet is open for seconds, the run
+     takes minutes. */
+  router.get(api('/tagging'), (_req, res) => res.json(taggingStatus()));
+
+  router.post(api('/tagging'), (_req, res) => {
+    if (!isLlmConfigured) return res.status(409).json({ error: 'tagging is off: LLM_API_KEY is not set' });
+    startTagBackfill();
+    res.status(202).json(taggingStatus());
+  });
+
   router.patch(api('/articles/:id'), (req, res) => {
     const id = Number(req.params.id);
     if (!store.getArticle(id)) return res.status(404).json({ error: 'not found' });
@@ -679,13 +692,54 @@ function withChallenge(article, extracted) {
 async function enrichInBackground(id) {
   try {
     const article = store.getArticle(id);
-    if (!article?.text_content) return;
+    if (!article?.text_content) return true;
     const verdict = await assessArticle(article);
     const patch = { tags: verdict.tags };
     if (article.quality !== 'partial' || verdict.quality === 'stub') patch.quality = verdict.quality;
     if (verdict.note) patch.quality_note = verdict.note;
     store.updateArticle(id, patch);
+    // a save that tags clears a stale failure; inside a run the failure stays
+    // on the report until the run is over
+    if (!backfill.running) backfill.lastError = null;
+    return true;
   } catch (error) {
     console.error(`enrich #${id} failed:`, error.message);
+    // Kept for the settings sheet: a failing provider used to be indistinguishable
+    // from one that was never configured, and the log is the last place anyone looks.
+    backfill.lastError = error.message;
+    return false;
   }
+}
+
+/* One backfill at a time, articles read in turn. Sequential is deliberate: the
+   provider is the slow part, and a burst of thirty parallel calls is how a key
+   gets rate-limited for the saves that matter more. */
+const backfill = { running: false, total: 0, done: 0, failed: 0, lastError: null, finishedAt: null };
+
+function taggingStatus() {
+  return {
+    enabled: isLlmConfigured,
+    untagged: store.untaggedArticleIds().length,
+    running: backfill.running,
+    total: backfill.total,
+    done: backfill.done,
+    failed: backfill.failed,
+    error: backfill.lastError,
+    finished_at: backfill.finishedAt,
+  };
+}
+
+function startTagBackfill() {
+  if (backfill.running) return;
+  const ids = store.untaggedArticleIds();
+  Object.assign(backfill, { running: true, total: ids.length, done: 0, failed: 0, lastError: null, finishedAt: null });
+  (async () => {
+    for (const id of ids) {
+      if (await enrichInBackground(id)) backfill.done += 1;
+      else backfill.failed += 1;
+    }
+  })().finally(() => {
+    backfill.running = false;
+    backfill.finishedAt = new Date().toISOString();
+  });
 }

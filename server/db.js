@@ -217,6 +217,15 @@ export function deleteArticle(id) {
   db.prepare('DELETE FROM articles WHERE id = ?').run(id);
 }
 
+/* Articles the tagging pass has not reached: saved before a key was set, or
+   saved while the provider was down. A link stub has no text to read, so it is
+   not untagged so much as untaggable, and stays out. */
+export function untaggedArticleIds() {
+  return db.prepare(`SELECT id FROM articles
+    WHERE (tags IS NULL OR tags IN ('', '[]')) AND text_content IS NOT NULL AND text_content != ''
+    ORDER BY saved_at DESC`).all().map(row => row.id);
+}
+
 /* The settings reset. Narrations and list membership cascade off the articles;
    the collections themselves are the reader's own structure, so they survive
    unless the caller asks for them too. */

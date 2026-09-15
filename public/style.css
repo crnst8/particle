@@ -295,6 +295,7 @@ input { font: inherit; color: inherit; }
   padding: .65rem 0; font-size: .92rem; color: var(--ink-2); min-width: 0;
 }
 #save-form.is-busy > :not(.shot-progress) { display: none; }
+.shot-progress[hidden] { display: none; }
 
 .shot-spin {
   flex: none; width: .85rem; height: .85rem; border-radius: 50%;
@@ -1033,6 +1034,20 @@ body.is-dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
   color: var(--ink-2); padding: .3rem .2rem;
 }
 .set-newlist button:hover { color: var(--accent); }
+
+/* tagging: one line of state, one button, a note only when there is something to say */
+#set-tagging[hidden] { display: none; }
+.set-tag-state { font-size: .9rem; color: var(--ink); min-width: 0; }
+.set-tag-state.is-off { color: var(--ink-3); }
+.set-tag-state.is-error { color: var(--warn); }
+.set-action-btn {
+  flex: none; font-size: .78rem; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-2); padding: .3rem .2rem;
+}
+.set-action-btn:hover:not(:disabled) { color: var(--accent); }
+.set-action-btn:disabled { opacity: .45; cursor: default; }
+.set-action-btn[hidden] { display: none; }
+.set-note:empty { display: none; }
 
 .set-check { display: flex; align-items: center; gap: .45rem; font-size: .85rem; color: var(--ink-2); cursor: pointer; margin-top: .7rem; }
 .set-check input { accent-color: var(--accent); }

@@ -1,5 +1,11 @@
 // Optional OpenAI-compatible helper. It reads excerpts from the article and
 // returns metadata only (quality verdict + tags); article text is never rewritten.
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const VERSION = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')).version;
 const API = process.env.LLM_API_URL || process.env.OPENCODE_API || 'https://opencode.ai/zen/go/v1/chat/completions';
 const KEY = process.env.LLM_API_KEY || process.env.OPENCODE_KEY || '';
 const MODEL = process.env.LLM_MODEL || process.env.OPENCODE_MODEL || 'deepseek-v4-flash';
@@ -9,6 +15,14 @@ const MODEL = process.env.LLM_MODEL || process.env.OPENCODE_MODEL || 'deepseek-v
    by erroring. */
 const VISION_MODEL = process.env.SCREENSHOT_MODEL || 'glm-5.3-flash';
 
+/* OpenCode Go refuses a request that carries no `x-opencode-session` — it routes
+   and caches by it — and asks callers to identify themselves rather than arrive
+   as a bare fetch. One id for the life of the process is the honest shape here:
+   every call is its own short conversation, and they share a system prompt worth
+   caching. Other OpenAI-compatible hosts ignore both headers. */
+const SESSION = randomUUID();
+const USER_AGENT = `particle/${VERSION} (+https://github.com/crnst8/particle)`;
+
 export const isLlmConfigured = Boolean(KEY);
 
 async function chat(messages, { maxTokens = 300, model = MODEL, timeout = 45000 } = {}) {
@@ -16,7 +30,12 @@ async function chat(messages, { maxTokens = 300, model = MODEL, timeout = 45000 
   const res = await fetch(API, {
     method: 'POST',
     signal: AbortSignal.timeout(timeout),
-    headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+    headers: {
+      'Authorization': `Bearer ${KEY}`,
+      'Content-Type': 'application/json',
+      'User-Agent': USER_AGENT,
+      'x-opencode-session': SESSION,
+    },
     body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0 }),
   });
   if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -144,7 +163,9 @@ Questions:
 
 Reply with JSON only: {"quality": "...", "note": "...", "tags": ["..."]}`,
     },
-  ], { maxTokens: 2000 });
+    // A reasoning model thinks before it answers, and a long article gives it
+    // more to think about; 45s cut off real answers on the longer pieces.
+  ], { maxTokens: 2000, timeout: 90_000 });
   const parsed = parseJsonLoose(reply);
   const quality = ['full', 'partial', 'stub'].includes(parsed.quality) ? parsed.quality : 'full';
   const tags = Array.isArray(parsed.tags)

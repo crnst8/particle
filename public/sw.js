@@ -1,6 +1,6 @@
 /* particle service worker — app shell offline + read-offline for visited articles */
-const SHELL = 'particle-shell-v9';
-const RUNTIME = 'particle-runtime-v9';
+const SHELL = 'particle-shell-v10';
+const RUNTIME = 'particle-runtime-v10';
 // Where a shared screenshot waits between the share target and the page.
 const SHARED = 'particle-shared-v1';
 const SHARED_KEY = 'shared-screenshot';

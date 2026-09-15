@@ -323,6 +323,9 @@ on trim mode:
 - Stores only the returned tags and completeness verdict.
 - Never rewrites article text.
 - Disabled by default until configured.
+- Settings shows whether it is on and how many articles have no tags, with a
+  button that tags them — for a library that predates the key, or outlived a
+  provider outage.
 
 
 ### Shortcuts:
