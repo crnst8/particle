@@ -114,6 +114,10 @@ __PARTICLE_ANALYTICS__
           <p class="article-site" id="a-site"></p>
           <h1 class="article-title" id="a-title"></h1>
           <p class="article-meta" id="a-meta"></p>
+          <div class="article-listen" id="a-listen" hidden>
+            <button id="a-listen-go" class="listen-go" type="button">&#9654; listen</button>
+            <button id="a-listen-over" class="linklike" type="button" hidden>start over</button>
+          </div>
           <div class="article-note" id="a-note" hidden></div>
           <div class="rescue" id="reader-rescue" role="status" aria-live="polite" hidden></div>
         </header>
@@ -159,19 +163,24 @@ __PARTICLE_ANALYTICS__
                  aria-label="Narration position">
           <div class="pl-line">
             <span id="pl-time" class="pl-time">0:00 / 0:00</span>
-            <span id="pl-now" class="pl-now" aria-live="polite"></span>
+            <span id="pl-now" class="pl-now"></span>
+            <span id="pl-live" class="sr-only" aria-live="polite"></span>
           </div>
         </div>
         <button id="pl-rate" class="pl-btn pl-rate" title="Playback speed">1&times;</button>
         <button id="pl-more" class="pl-btn" title="Narration settings" aria-expanded="false">&#8943;</button>
         <button id="pl-close" class="pl-btn" title="Stop listening">&times;</button>
       </div>
+      <div id="pl-actions" class="pl-actions-row" role="group" aria-label="Narration problem" hidden></div>
       <div id="pl-panel" class="pl-panel" hidden></div>
     </div>
   </article>
 
   <!-- ── Popover menu (row actions / reader overflow) ──────────── -->
   <div id="menu" class="menu" hidden role="menu" aria-label="Article actions"></div>
+
+  <!-- ── Beside a text selection in the article ────────────────── -->
+  <div id="speech-pop" class="speech-pop" hidden role="toolbar" aria-label="Narration"></div>
 
   <!-- ── Settings ─────────────────────────────────────────────── -->
   <div id="settings" class="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -229,6 +238,17 @@ __PARTICLE_ANALYTICS__
             them a <em>read</em> tab of their own.</p>
         </section>
 
+        <section class="set-group" id="set-narration" hidden>
+          <h3>narration</h3>
+          <div class="set-row">
+            <label id="set-voice-label">default voice</label>
+            <span class="set-voice-now" id="set-voice-now" aria-labelledby="set-voice-label"></span>
+            <button id="set-voice-choose" class="set-action-btn" type="button">change</button>
+          </div>
+          <p class="set-note" id="set-voice-note" hidden></p>
+          <div id="set-voice-picker" class="voice-picker" hidden></div>
+        </section>
+
         <section class="set-group" id="set-tagging" hidden>
           <h3>tagging</h3>
           <div class="set-row">
@@ -269,6 +289,6 @@ __PARTICLE_ANALYTICS__
   </div>
 </div>
 <script src="__PARTICLE_BASE__/store-local.js"></script>
-<script src="__PARTICLE_BASE__/app.js"></script>
+<script type="module" src="__PARTICLE_BASE__/app.js"></script>
 </body>
 </html>

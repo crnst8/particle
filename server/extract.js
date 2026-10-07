@@ -87,9 +87,52 @@ function parseDom(html, url) {
   return new JSDOM(html, { url, virtualConsole: vc });
 }
 
+/* Readability drops every class, which is right for styling and wrong for the
+   handful that say what a block is. Those few are recognised first and given
+   names Readability is told to keep; nothing else survives. */
+const SPEECH_CLASSES = ['speech-caption', 'speech-credit', 'speech-info'];
+
 function readabilityParse(dom) {
-  const reader = new Readability(dom.window.document, { keepClasses: false });
+  const reader = new Readability(dom.window.document, { keepClasses: false, classesToPreserve: SPEECH_CLASSES });
   return reader.parse();
+}
+
+/* Captions, credits and bylines are read silently by a person and should not be
+   read aloud by particle. The page's own markup is the best evidence of which
+   is which, and it is about to be thrown away, so the evidence is written down
+   as one of three classes the narration script recognises. Only short blocks
+   are marked: a container that happens to carry "caption" in a class name and
+   holds the whole article is not a caption. */
+const CAPTION_TOKEN = /(?:^|[-_])(?:caption|captions|figcaption|caption-text|wp-caption-text)(?:[-_]|$)/;
+const CREDIT_TOKEN = /(?:^|[-_])(?:credit|credits|photo-credit|image-credit|copyright|attribution)(?:[-_]|$)/;
+const INFO_TOKEN = /(?:^|[-_])(?:byline|bylines|dateline|timestamp|pubdate|publish-date|published-date|article-meta|post-meta|entry-meta|story-meta|metadata|reading-time|read-time|readtime|author-name|authors?)(?:[-_]|$)/;
+const CAPTION_PROPS = new Set(['caption']);
+const CREDIT_PROPS = new Set(['copyrightholder', 'credittext', 'copyrightnotice']);
+const INFO_PROPS = new Set(['author', 'datepublished', 'datemodified', 'datecreated', 'creator', 'publisher']);
+
+export function markSpeechSemantics(dom) {
+  const doc = dom.window.document;
+  // a page does not get to label its own content for the narrator
+  for (const el of doc.querySelectorAll(SPEECH_CLASSES.map(name => `.${name}`).join(', '))) {
+    el.classList.remove(...SPEECH_CLASSES);
+  }
+  for (const el of doc.querySelectorAll('[data-particle-speech]')) el.removeAttribute('data-particle-speech');
+
+  const short = (el, limit) => (el.textContent || '').replace(/\s+/g, ' ').trim().length <= limit;
+  const mark = (el, name, limit) => { if (short(el, limit)) el.classList.add(name); };
+
+  for (const el of doc.querySelectorAll('[itemprop]')) {
+    const props = (el.getAttribute('itemprop') || '').toLowerCase().split(/\s+/);
+    if (props.some(prop => CAPTION_PROPS.has(prop))) mark(el, 'speech-caption', 400);
+    else if (props.some(prop => CREDIT_PROPS.has(prop))) mark(el, 'speech-credit', 200);
+    else if (props.some(prop => INFO_PROPS.has(prop))) mark(el, 'speech-info', 200);
+  }
+  for (const el of doc.querySelectorAll('[class]')) {
+    const tokens = [...el.classList].map(token => token.toLowerCase());
+    if (tokens.some(token => CAPTION_TOKEN.test(token))) mark(el, 'speech-caption', 400);
+    else if (tokens.some(token => CREDIT_TOKEN.test(token))) mark(el, 'speech-credit', 200);
+    else if (tokens.some(token => INFO_TOKEN.test(token))) mark(el, 'speech-info', 200);
+  }
 }
 
 // Readability strips <aside>-style pullquotes on some sites; give obvious pullquote
@@ -137,16 +180,23 @@ function extractMeta(dom) {
   };
 }
 
+/* One data attribute is allowed through: the reader's own "read this aloud" /
+   "skip this" mark on a block, and only with one of its two values. */
+const SPEECH_MARKS = new Set(['exclude', 'include']);
+
 function makeSanitizer() {
   const window = new JSDOM('').window;
   const DOMPurify = createDOMPurify(window);
+  DOMPurify.addHook('uponSanitizeAttribute', (_node, data) => {
+    if (data.attrName === 'data-particle-speech' && !SPEECH_MARKS.has(data.attrValue)) data.keepAttr = false;
+  });
   return (html) => DOMPurify.sanitize(html, {
     ALLOWED_TAGS: ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'figure', 'figcaption',
       'img', 'a', 'em', 'i', 'strong', 'b', 'u', 's', 'ul', 'ol', 'li', 'pre', 'code', 'hr', 'br',
       'table', 'thead', 'tbody', 'tr', 'th', 'td', 'caption', 'sup', 'sub', 'mark', 'cite', 'q',
       'span', 'div', 'section', 'audio', 'video', 'source', 'time', 'abbr', 'dl', 'dt', 'dd'],
     ALLOWED_ATTR: ['href', 'src', 'srcset', 'sizes', 'alt', 'title', 'width', 'height', 'datetime',
-      'colspan', 'rowspan', 'class', 'lang', 'dir', 'controls', 'type', 'loading'],
+      'colspan', 'rowspan', 'class', 'lang', 'dir', 'controls', 'type', 'loading', 'data-particle-speech'],
     ALLOW_DATA_ATTR: false,
   });
 }
@@ -203,6 +253,7 @@ function parseAttempt(html, url, method, { preclean } = {}) {
   preclean?.(dom);
   const meta = extractMeta(dom);
   promotePullquotes(dom);
+  markSpeechSemantics(dom);
   const article = readabilityParse(dom);
   if (!article || !article.content) return { ok: false, reason: 'readability found no article', meta };
 

@@ -724,11 +724,24 @@ body.is-dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
   .article-body .is-narrating { transition: none; }
 }
 [data-listening="1"] .reader-inner { padding-bottom: 9rem; }
-[data-listening="1"] #a-body p,
-[data-listening="1"] #a-body h2,
-[data-listening="1"] #a-body h3,
-[data-listening="1"] #a-body blockquote,
-[data-listening="1"] #a-body li { cursor: pointer; }
+/* what narration passes over stays on the page, a shade quieter while listening */
+[data-listening="1"] .article-body .is-unspoken { opacity: .55; }
+
+.article-listen {
+  display: flex; align-items: center; gap: .9rem;
+  margin-top: .9rem;
+  font-family: var(--sans);
+}
+.article-listen[hidden] { display: none; }
+.listen-go {
+  font-size: .8rem; letter-spacing: .06em;
+  padding: .35rem .8rem;
+  color: var(--bg); background: var(--accent);
+  border-radius: 999px;
+}
+.listen-go:hover { filter: brightness(1.08); }
+.listen-go:focus-visible, .article-listen .linklike:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.article-listen .linklike[hidden] { display: none; }
 
 .player {
   position: absolute;
@@ -767,6 +780,11 @@ body.is-dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
   border-radius: 50%;
 }
 .pl-play:hover { color: var(--bg); background: var(--accent); filter: brightness(1.08); }
+/* waiting on a passage: the button says so without a spinner */
+.pl-play.is-waiting { animation: pl-wait 1.4s ease-in-out infinite; }
+@keyframes pl-wait { 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { .pl-play.is-waiting { animation: none; opacity: .7; } }
+.pl-seek:disabled { opacity: .4; cursor: default; }
 .pl-skip { font-size: 1rem; }
 .pl-rate { font-variant-numeric: tabular-nums; min-width: 2.4rem; }
 
@@ -803,6 +821,18 @@ body.is-dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
 }
 .pl-now.error { color: var(--warn); }
 
+.pl-actions-row {
+  display: flex; flex-wrap: wrap; gap: .4rem 1rem;
+  max-width: 46rem;
+  margin: .35rem auto 0;
+  padding-left: 2.6rem;
+  font-family: var(--sans);
+}
+.pl-actions-row[hidden] { display: none; }
+.pl-actions-row .linklike { font-size: .8rem; }
+.pl-offline { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .6rem; }
+.pl-error { color: var(--warn); }
+
 .pl-panel {
   max-width: 46rem;
   margin: .55rem auto 0;
@@ -827,43 +857,87 @@ body.is-dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
 .pl-toggles label { display: flex; align-items: center; gap: .35rem; cursor: pointer; }
 .pl-actions { display: flex; gap: .9rem; margin-top: .55rem; }
 
-.pl-voices {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
-  gap: .3rem;
-  margin-top: .6rem;
-  max-height: 11rem;
-  overflow-y: auto;
+/* ── voice picker: settings default and the player's per-article choice ── */
+.voice-picker { margin-top: .6rem; font-family: var(--sans); }
+.voice-picker[hidden] { display: none; }
+.voice-search {
+  width: 100%;
+  padding: .45rem .6rem;
+  font: inherit; font-size: .85rem;
+  color: var(--ink); background: var(--card);
+  border: 1px solid var(--line); border-radius: 3px;
 }
-.pl-voices[hidden] { display: none; }
-.pl-voice {
-  display: flex; flex-direction: column; gap: .1rem;
-  padding: .4rem .5rem;
-  text-align: left;
-  border: 1px solid var(--line);
-  border-radius: 3px;
+.voice-search:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.voice-note { margin: .45rem 0 0; font-size: .75rem; color: var(--ink-3); }
+.voice-note[hidden] { display: none; }
+.voice-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+  gap: .3rem;
+  margin-top: .5rem;
+  max-height: 15rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.voice-row {
+  display: flex; align-items: stretch;
+  border: 1px solid var(--line); border-radius: 3px;
   background: var(--card);
 }
-.pl-voice:hover { border-color: var(--ink-3); }
-/* the voice currently reading, so the list says where you already are */
-.pl-voice.is-cast { border-color: var(--accent); }
-.pl-voice.is-cast .pl-voice-name::after { content: ' · reading'; color: var(--ink-3); }
-.pl-voice-name { color: var(--ink); font-size: .78rem; }
-.pl-voice-tags { color: var(--ink-3); font-size: .68rem; }
-/* the shortlist and the rest of the catalogue are two lists, not one long one */
-.pl-voice-head {
-  grid-column: 1 / -1;
-  margin: .3rem 0 0;
-  color: var(--ink-3);
-  font-size: .66rem;
-  letter-spacing: .06em;
-  text-transform: uppercase;
+.voice-row:hover { border-color: var(--ink-3); }
+/* the voice already chosen, so the list says where you already are */
+.voice-row.is-chosen { border-color: var(--accent); }
+.voice-pick {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column; gap: .1rem;
+  padding: .45rem .55rem;
+  text-align: left;
 }
-.pl-voice-head:first-child { margin-top: 0; }
+.voice-pick:focus-visible, .voice-sample:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.voice-name { color: var(--ink); font-size: .8rem; overflow-wrap: anywhere; }
+.voice-role { color: var(--ink-3); font-size: .68rem; }
+.voice-tags { color: var(--ink-3); font-size: .68rem; }
+.voice-sample {
+  flex: none;
+  min-width: 2.2rem;
+  padding: 0 .5rem;
+  font-size: .72rem;
+  color: var(--ink-2);
+  border-left: 1px solid var(--line);
+}
+.voice-sample:hover:not(:disabled) { color: var(--accent); }
+.voice-sample:disabled { font-size: .64rem; cursor: default; }
+.voice-more { grid-column: 1 / -1; justify-self: start; margin: .3rem 0; font-size: .78rem; }
+.set-voice-now { flex: 1; min-width: 0; font-size: .88rem; color: var(--ink-2); text-align: right; overflow-wrap: anywhere; }
+
+/* ── beside a selection in the article ── */
+.speech-pop {
+  position: fixed;
+  z-index: 35;
+  display: flex; flex-wrap: wrap; align-items: center; gap: .25rem;
+  max-width: min(22rem, calc(100vw - 1rem));
+  padding: .3rem;
+  font-family: var(--sans);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .14);
+}
+.speech-pop[hidden] { display: none; }
+.speech-pop button {
+  padding: .4rem .6rem;
+  min-height: 2.25rem;
+  font-size: .8rem;
+  color: var(--ink);
+  border-radius: 4px;
+}
+.speech-pop button:hover, .speech-pop button:focus-visible { background: var(--line); outline: none; }
+.speech-why { width: 100%; padding: .2rem .6rem 0; font-size: .72rem; color: var(--ink-3); }
 
 @media (max-width: 32rem) {
   .pl-skip { display: none; }
-  .pl-voices { grid-template-columns: 1fr; }
+  .voice-list { grid-template-columns: 1fr; }
+  .pl-actions-row { padding-left: 0; }
 }
 
 /* ── Popover menu ─────────────────────────────────────────────────────────

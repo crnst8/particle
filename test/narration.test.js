@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildScript, speakable, splitForSynthesis, detectLanguage, toneProfile,
-  shortlistVoices, segmentStyle, contentHash, planNarration, castingReason,
+  buildScript, classifyNarrationBlocks, speakable, splitForSynthesis, detectLanguage, toneProfile,
+  shortlistVoices, segmentStyle, segmentPolicy, scriptIdentity, mapLegacyPosition, legacyContentHash,
 } from '../server/narration.js';
-import { narrationRev } from '../server/narrator.js';
+import { contentRevision, narrationRev, scriptId } from '../server/narration-identity.js';
+import { extractFromHtml, sanitizeArticleHtml } from '../server/extract.js';
 
 const article = (extra = {}) => ({
   id: 1,
@@ -69,108 +70,267 @@ test('empty and punctuation-only input yields nothing to say', () => {
 
 // ── splitting ────────────────────────────────────────────────────────────────
 
-test('splits long text on sentence boundaries under the cap', () => {
-  const sentence = 'This is a sentence of a reasonable length that runs on a while. ';
-  const parts = splitForSynthesis(sentence.repeat(30), 400);
+const rejoin = parts => parts.map(part => part.text).join(' ');
+
+test('splits long text on sentence boundaries near the target, never past the cap', () => {
+  const sentence = 'This is a sentence of a reasonable length that runs on a while.';
+  const text = Array(30).fill(sentence).join(' ');
+  const parts = splitForSynthesis(text, { target: 300, max: 450 });
   assert.ok(parts.length > 1);
-  for (const part of parts) assert.ok(part.length <= 400, `part too long: ${part.length}`);
-  assert.equal(parts.join(' ').replace(/\s+/g, ' ').trim(), sentence.repeat(30).trim());
+  for (const part of parts) {
+    assert.ok(part.text.length <= 450, `part too long: ${part.text.length}`);
+    assert.equal(text.slice(part.start, part.end), part.text);
+    assert.match(part.text, /\.$/, 'a passage ends where a sentence does');
+  }
+  assert.equal(rejoin(parts), text);
 });
 
-test('a single runaway sentence is split at clause boundaries', () => {
-  const parts = splitForSynthesis(`${'clause after clause, '.repeat(40)}end.`, 300);
+test('a sentence up to the cap stays whole even past the target', () => {
+  const long = `${'word '.repeat(80).trim()}.`;   // ~400 characters, one sentence
+  const parts = splitForSynthesis(`Short one. ${long}`, { target: 300, max: 450 });
+  assert.equal(parts.length, 2);
+  assert.equal(parts[1].text, long);
+});
+
+test('a runaway sentence is cut at clauses, then between words, never inside a word', () => {
+  const text = `${'clause after clause, '.repeat(40)}end.`;
+  const parts = splitForSynthesis(text, { target: 300, max: 450 });
   assert.ok(parts.length > 1);
-  for (const part of parts) assert.ok(part.length <= 300);
+  for (const part of parts) assert.ok(part.text.length <= 450);
+  assert.equal(rejoin(parts), text);
+
+  const words = Array(200).fill('unbroken').join(' ');
+  const cut = splitForSynthesis(words, { target: 300, max: 450 });
+  for (const part of cut) assert.match(part.text, /^(unbroken ?)+$/);
+  assert.equal(rejoin(cut), words);
+});
+
+test('only a single token longer than a passage is cut mid-word', () => {
+  const token = 'x'.repeat(1000);
+  const parts = splitForSynthesis(token, { target: 300, max: 450 });
+  assert.ok(parts.every(part => part.text.length <= 450));
+  assert.equal(parts.map(part => part.text).join(''), token);
 });
 
 test('short text is left in one piece', () => {
-  assert.deepEqual(splitForSynthesis('Short enough.', 400), ['Short enough.']);
+  assert.deepEqual(splitForSynthesis('Short enough.'), [{ text: 'Short enough.', start: 0, end: 13 }]);
 });
 
-// ── script ───────────────────────────────────────────────────────────────────
-
-test('builds an opening line, the body in order, and a close', () => {
-  const script = buildScript(article({
-    content_html: '<p>First paragraph of the piece.</p><h2>A section</h2><p>Second paragraph here.</p>',
-  }));
-  const kinds = script.segments.map(segment => segment.kind);
-  assert.deepEqual(kinds, ['intro', 'text', 'heading', 'text', 'outro']);
-  assert.match(script.segments[0].text, /Example\. A Story\. By Jane Doe\. 2 minutes\./);
-  assert.equal(script.segments.at(-1).text, 'End of article, from Example.');
+test('TTS_SEGMENT_CHARS caps the passage length and the default is 300/450', () => {
+  assert.deepEqual(segmentPolicy(undefined), { target: 300, max: 450 });
+  assert.deepEqual(segmentPolicy('200'), { target: 200, max: 200 });
+  assert.deepEqual(segmentPolicy('1100'), { target: 300, max: 1100 });
 });
 
-test('a heading is given more silence after it than a paragraph', () => {
-  const script = buildScript(article({ content_html: '<h2>Section</h2><p>Body text goes here.</p>' }));
-  const heading = script.segments.find(segment => segment.kind === 'heading');
-  const text = script.segments.find(segment => segment.kind === 'text');
-  assert.ok(heading.pause > text.pause);
-  assert.ok(text.pause > 0);
+// ── what is spoken ───────────────────────────────────────────────────────────
+
+const script = (content_html, extra = {}) => buildScript(article({ content_html, ...extra }));
+const spoken = s => s.segments.map(segment => segment.text);
+const reasons = s => s.blocks.filter(block => block.skip_reason).map(block => block.skip_reason);
+
+test('no intro, no outro: only the article body is spoken', () => {
+  const s = script('<p>First paragraph of the piece.</p><h2>A section</h2><p>Second paragraph here.</p>');
+  assert.deepEqual(spoken(s), ['First paragraph of the piece.', 'A section.', 'Second paragraph here.']);
+  assert.deepEqual(s.segments.map(segment => segment.kind), ['text', 'heading', 'text']);
+  assert.ok(!spoken(s).some(text => /Jane Doe|Example|End of article|minute/.test(text)));
 });
 
-test('a paragraph split in two pauses less in the middle than at the end', () => {
-  const long = `${'A sentence that keeps going and going for a while. '.repeat(40)}`;
-  const script = buildScript(article({ content_html: `<p>${long}</p>` }));
-  const parts = script.segments.filter(segment => segment.kind === 'text');
-  assert.ok(parts.length > 1);
-  assert.ok(parts[0].pause < parts.at(-1).pause);
+test('an empty article has nothing to read', () => {
+  assert.deepEqual(script('').segments, []);
+  assert.deepEqual(script('<figure><img src="a.jpg"><figcaption>Only a caption.</figcaption></figure>').segments, []);
+});
+
+test('a nested figcaption is never spoken, and stays in the map with its reason', () => {
+  const s = script('<p>Body text that is read.</p><figure><img src="a.jpg" alt="Alt text never read"><figcaption>A caption under the photo.</figcaption></figure><p>More body.</p>');
+  assert.deepEqual(spoken(s), ['Body text that is read.', 'More body.']);
+  assert.deepEqual(reasons(s), ['caption']);
+  const caption = s.blocks.find(block => block.skip_reason === 'caption');
+  assert.equal(caption.dom_index, 1);   // p, then figcaption: a figure is not itself a block
+});
+
+test('a credit paragraph beside a picture is left out; prose mentioning photos is not', () => {
+  const s = script('<p>Before the image.</p><p><img src="a.jpg"></p><p>Photo: Jane Smith/AP</p>'
+    + '<p>The photo he took in 1998 is now in a museum.</p>');
+  assert.deepEqual(spoken(s), ['Before the image.', 'The photo he took in 1998 is now in a museum.']);
+  const credit = s.blocks.find(block => block.skip_reason === 'credit');
+  assert.equal(credit.inferred, true);
+});
+
+test('a credit line with no picture beside it is kept: the evidence is not there', () => {
+  const s = script('<p>Some text first that is long enough.</p><p>Photo: Jane Smith/AP</p>');
+  assert.equal(s.segments.length, 2);
+});
+
+test('byline, dateline and reading time at the top are not read', () => {
+  const s = script('<p>By Jane Doe</p><p>March 3, 2024</p><p>5 min read</p>'
+    + '<p>The first real paragraph of the article, long enough to count as prose for sure, with more words in it.</p>');
+  assert.deepEqual(spoken(s), ['The first real paragraph of the article, long enough to count as prose for sure, with more words in it.']);
+  assert.deepEqual(reasons(s), ['metadata', 'metadata', 'metadata']);
+});
+
+test('a combined metadata line is recognised piece by piece', () => {
+  const s = script('<p>By Jane Doe · Updated 4 March 2024 10:30 GMT · 6 min read</p><p>Body.</p>');
+  assert.deepEqual(spoken(s), ['Body.']);
+});
+
+test('prose that mentions a date or a byline is still read', () => {
+  const s = script('<p>On March 3, 2024 the council voted, by a narrow margin, to keep the library open.</p>'
+    + '<p>Written by hand, the caption on the photo was illegible.</p>');
+  assert.equal(s.segments.length, 2);
+});
+
+test('metadata later in the article is prose until proven otherwise', () => {
+  const body = 'A long opening paragraph with plenty of words in it, enough that the opening is clearly over now.';
+  const s = script(`<p>${body}</p><p>March 3, 2024</p>`);
+  assert.equal(s.segments.length, 2);
+});
+
+test('an opening heading identical to the title is skipped; section headings are read', () => {
+  const s = script('<h1>A Story</h1><p>Body text of the story.</p><h2>A Story</h2><p>More.</p>');
+  assert.deepEqual(spoken(s), ['Body text of the story.', 'A Story.', 'More.']);
+  assert.deepEqual(reasons(s), ['title']);
+});
+
+test('table contents are never spoken, even inside paragraphs', () => {
+  const s = script('<p>Before the table.</p><table><tr><td><p>Cell paragraph.</p></td><td>Bare cell</td></tr></table><p>After.</p>');
+  assert.deepEqual(spoken(s), ['Before the table.', 'After.']);
+  assert.ok(reasons(s).every(reason => reason === 'table'));
+});
+
+test('code inside a quote is dropped without taking the quote with it', () => {
+  const s = script('<blockquote><p>He wrote this down for us.</p><pre>rm -rf /tmp/x</pre></blockquote>');
+  assert.deepEqual(spoken(s), ['He wrote this down for us.']);
+  assert.equal(s.segments[0].kind, 'quote');
+  assert.ok(reasons(s).includes('code'));
+});
+
+test('a paragraph that is only code is a listing', () => {
+  const s = script('<p>Run the following command now.</p><p><code>npm install --save particle</code></p>'
+    + '<p>Then call <code>listen()</code> to start.</p>');
+  assert.deepEqual(spoken(s), ['Run the following command now.', 'Then call listen() to start.']);
+});
+
+test('a genuine quotation is read as a quote', () => {
+  const s = script('<p>She was unambiguous about the whole affair.</p><blockquote>I never agreed to any of it.</blockquote>');
+  assert.deepEqual(s.segments.map(segment => segment.kind), ['text', 'quote']);
 });
 
 test('a pullquote repeating the body is not read twice', () => {
   const line = 'The whole point of the exercise was to see whether anyone would notice at all.';
-  const script = buildScript(article({
-    content_html: `<p>${line} And then some more text after it.</p><blockquote class="pullquote">${line}</blockquote>`,
-  }));
-  assert.equal(script.segments.filter(segment => segment.kind === 'quote').length, 0);
-  assert.ok(script.blocks.some(block => block.skip === 'duplicate'));
+  const s = script(`<p>${line} And then some more text after it.</p><blockquote><p>${line}</p></blockquote>`);
+  assert.equal(s.segments.filter(segment => segment.kind === 'quote').length, 0);
+  const dup = s.blocks.find(block => block.skip_reason === 'duplicate');
+  assert.equal(dup.inferred, true);
 });
 
-test('a genuine quotation survives', () => {
-  const script = buildScript(article({
-    content_html: '<p>She was unambiguous about the whole affair.</p><blockquote>I never agreed to any of it.</blockquote>',
-  }));
-  assert.equal(script.segments.filter(segment => segment.kind === 'quote').length, 1);
+test('a nested list is read once per item, outer before inner, in order', () => {
+  const s = script('<ul><li>Outer one<ul><li>Inner a</li><li>Inner b</li></ul>still outer</li><li>Outer two</li></ul>');
+  assert.deepEqual(spoken(s), ['Outer one.', 'Inner a.', 'Inner b.', 'still outer.', 'Outer two.']);
+  const words = spoken(s).join(' ').match(/\w+/g);
+  assert.equal(words.filter(word => word === 'Inner').length, 2, 'every word exactly once');
 });
 
-test('code blocks are marked skipped rather than read out', () => {
-  const script = buildScript(article({ content_html: '<p>Then run this.</p><pre>rm -rf /tmp/x</pre>' }));
-  assert.ok(!script.segments.some(segment => segment.text.includes('rm -rf')));
-  assert.ok(script.blocks.some(block => block.skip === 'code'));
+test('repeated identical paragraphs get distinct, stable ids', () => {
+  const s = script('<p>Again.</p><p>Different.</p><p>Again.</p>');
+  const ids = s.segments.map(segment => segment.block_id);
+  assert.equal(new Set(ids).size, 3);
+  assert.match(ids[0], /-0$/);
+  assert.match(ids[2], /-1$/);
+  assert.equal(ids[0].replace(/-\d+$/, ''), ids[2].replace(/-\d+$/, ''));
 });
 
-test('nested blocks are read once, by their outermost owner', () => {
-  const script = buildScript(article({
-    content_html: '<blockquote><p>Only once, please, and at some length.</p></blockquote>',
-  }));
-  const spoken = script.segments.filter(segment => segment.kind === 'quote');
-  assert.equal(spoken.length, 1);
-  assert.equal(spoken.filter(segment => segment.text.includes('Only once')).length, 1);
+test('a block keeps its id when the paragraphs around it change', () => {
+  const before = script('<p>One.</p><p>The paragraph a bookmark points at.</p>');
+  const after = script('<p>A new opening.</p><p>One, rewritten.</p><p>The paragraph a bookmark points at.</p>');
+  assert.equal(before.segments[1].block_id, after.segments[2].block_id);
 });
 
-test('block indices address the same node list the reader queries', () => {
-  const script = buildScript(article({
-    content_html: '<p>One paragraph here.</p><ul><li>An item worth saying.</li></ul><p>Another paragraph.</p>',
-  }));
-  // p, li, p — the <ul> itself is not in the selector
-  assert.deepEqual(script.blocks.map(block => block.kind), ['text', 'item', 'text']);
-  const item = script.segments.find(segment => segment.kind === 'item');
-  assert.deepEqual(item.blocks, [1]);
+test('bare prose in a div is spoken in order around its child paragraphs', () => {
+  const s = script('<div>Bare text before. <p>A child paragraph.</p> Bare text after.</div>');
+  assert.deepEqual(spoken(s), ['Bare text before.', 'A child paragraph.', 'Bare text after.']);
+  const runs = s.segments.map(segment => [segment.dom_index, segment.run]);
+  assert.deepEqual(runs, [[0, 0], [1, 0], [0, 1]]);
 });
 
-test('consecutive short paragraphs are merged into one breath', () => {
-  const script = buildScript(article({ content_html: '<p>Short one.</p><p>Short two.</p><p>Short three.</p>' }));
-  const merged = script.segments.find(segment => segment.kind === 'text');
-  assert.deepEqual(merged.blocks, [0, 1, 2]);
-  assert.equal(merged.text, 'Short one. Short two. Short three.');
+test('PDF and OCR paragraphs read as ordinary prose', () => {
+  const s = script('<h1>A Story</h1><p>Recovered paragraph one from a scanned page.</p><h2>Methods</h2><p>Recovered paragraph two.</p>');
+  assert.deepEqual(spoken(s), ['Recovered paragraph one from a scanned page.', 'Methods.', 'Recovered paragraph two.']);
 });
 
-test('an article with no body still gets no stray closing line', () => {
-  const script = buildScript(article({ content_html: '' }));
-  assert.deepEqual(script.segments.map(segment => segment.kind), ['intro']);
+test('one segment never spans two blocks, and offsets point into the block text', () => {
+  const long = Array(20).fill('A sentence that keeps going and going for a while.').join(' ');
+  const s = script(`<p>Short one.</p><p>Short two.</p><p>${long}</p>`);
+  assert.equal(s.segments[0].text, 'Short one.');
+  assert.equal(s.segments[1].text, 'Short two.');
+  const parts = s.segments.filter(segment => segment.dom_index === 2);
+  assert.ok(parts.length > 1);
+  assert.deepEqual(parts.map(part => part.part), parts.map((_, i) => i));
+  assert.ok(parts[0].pause < parts.at(-1).pause, 'mid-paragraph pauses are shorter');
+  assert.equal(parts.map(part => part.text).join(' '), speakable(long));
+  for (const part of parts) assert.equal(speakable(long).slice(part.start, part.end), part.text);
+  assert.ok(s.segments.every(segment => segment.id === `${segment.block_id}.${segment.part}`));
 });
 
-test('the direction can replace the spoken opening', () => {
-  const script = buildScript(article({ content_html: '<p>Body copy here.</p>' }), { intro: 'Custom opening line' });
-  assert.equal(script.segments[0].text, 'Custom opening line.');
+test('a heading is given more silence after it than a paragraph', () => {
+  const s = script('<h2>Section</h2><p>Body text goes here.</p>');
+  assert.ok(s.segments[0].pause > s.segments[1].pause);
+  assert.ok(s.segments[1].pause > 0);
+});
+
+test('a reader\'s skip mark always wins; read-aloud undoes only a guess', () => {
+  const html = '<p>By Jane Doe</p><p data-particle-speech="exclude">A paragraph the reader skipped.</p>'
+    + '<p>Kept prose that is read aloud.</p><figure><figcaption data-particle-speech="include">Caption.</figcaption></figure>';
+  const s = script(html);
+  assert.deepEqual(spoken(s), ['Kept prose that is read aloud.']);
+  assert.deepEqual(reasons(s), ['metadata', 'manual', 'caption']);
+
+  const included = script(html.replace('<p>By Jane Doe</p>', '<p data-particle-speech="include">By Jane Doe</p>'));
+  assert.deepEqual(spoken(included), ['By Jane Doe.', 'Kept prose that is read aloud.']);
+});
+
+test('the client gets the selector, so it never keeps a second classifier', () => {
+  const s = script('<p>Text.</p>');
+  assert.equal(typeof s.selector, 'string');
+  assert.deepEqual(s.policy, { target: 300, max: 450 });
+});
+
+// ── through extraction ───────────────────────────────────────────────────────
+
+test('a real page keeps its caption and credit semantics through Readability and the sanitiser', () => {
+  const paragraph = n => `<p>Paragraph ${n} of the story has enough words in it to be counted as real prose by the extractor, and it goes on a little longer.</p>`;
+  const page = `<!doctype html><html><head><title>A Story</title></head><body><article>
+    <h1>A Story</h1>
+    <div class="article-meta"><span class="byline">By Jane Doe</span> <time datetime="2024-03-03">March 3, 2024</time></div>
+    ${paragraph(1)}${paragraph(2)}
+    <div class="wp-caption"><img src="https://example.com/a.jpg" alt="alt"><p class="wp-caption-text">The harbour at dawn.</p></div>
+    <p class="photo-credit">Photo: Jane Smith/AP</p>
+    ${paragraph(3)}${paragraph(4)}${paragraph(5)}
+  </article></body></html>`;
+  const extracted = extractFromHtml('https://example.com/story', page);
+  assert.match(extracted.content_html, /speech-caption/);
+  assert.match(extracted.content_html, /speech-credit/);
+  const s = buildScript({ ...extracted, id: 1 });
+  const text = spoken(s).join(' ');
+  assert.doesNotMatch(text, /harbour at dawn/);
+  assert.doesNotMatch(text, /Jane Smith/);
+  assert.match(text, /Paragraph 1/);
+  assert.match(text, /Paragraph 5/);
+  // the reader still sees every word
+  assert.match(extracted.content_html, /The harbour at dawn/);
+});
+
+test('a page cannot label its own text for the narrator', () => {
+  const page = `<html><body><article>${'<p>Plain article paragraph with enough words to be read as prose by the extractor today.</p>'.repeat(5)}
+    <p class="speech-credit" data-particle-speech="exclude">Visible text the page tried to hide from narration.</p></article></body></html>`;
+  const extracted = extractFromHtml('https://example.com/story', page);
+  assert.doesNotMatch(extracted.content_html, /speech-credit|data-particle-speech/);
+});
+
+test('the sanitiser keeps only the two speech marks', () => {
+  assert.match(sanitizeArticleHtml('<p data-particle-speech="exclude">x</p>'), /data-particle-speech="exclude"/);
+  assert.match(sanitizeArticleHtml('<p data-particle-speech="include">x</p>'), /data-particle-speech="include"/);
+  assert.doesNotMatch(sanitizeArticleHtml('<p data-particle-speech="evil">x</p>'), /data-particle-speech/);
+  assert.doesNotMatch(sanitizeArticleHtml('<p data-other="1">x</p>'), /data-other/);
 });
 
 // ── casting ──────────────────────────────────────────────────────────────────
@@ -244,16 +404,6 @@ test('selling tags cost a voice the reading', () => {
   assert.equal(shortlistVoices(article({ tags: ['software'] }), voices)[0].id, 'plain');
 });
 
-test('the casting reason names what the voice was picked on', () => {
-  const reason = castingReason(
-    { id: 'v', title: 'V', tags: ['narration', 'calm', 'measured', 'deep'] },
-    toneProfile(article({ tags: ['philosophy'] })),
-  );
-  assert.match(reason, /measured/);
-  assert.match(reason, /essay/);
-  assert.doesNotMatch(reason, /deep/);
-});
-
 test('ranking is stable for one article and differs across articles', () => {
   const voices = Array.from({ length: 8 }, (_, i) => ({
     id: `v${i}`, title: `V${i}`, tags: ['narration', 'clear'], popularity: 1000, description: '',
@@ -268,7 +418,6 @@ test('delivery is shaped per block kind and stays inside the model limits', () =
   const direction = { speed: 1, temperature: 0.7, top_p: 0.7 };
   assert.ok(segmentStyle('heading', direction).speed < segmentStyle('text', direction).speed);
   assert.ok(segmentStyle('quote', direction).temperature > segmentStyle('text', direction).temperature);
-  assert.ok(segmentStyle('caption', direction).volume < 0);
 
   const extreme = segmentStyle('quote', { speed: 99, temperature: 99, top_p: 99 });
   assert.ok(extreme.speed <= 2 && extreme.temperature <= 1 && extreme.topP <= 1);
@@ -280,36 +429,55 @@ test('language is detected from the article text', () => {
   assert.equal(detectLanguage('これは日本語の文章です。'), 'ja');
 });
 
-test('the content hash changes when the article does', () => {
+// ── identity ─────────────────────────────────────────────────────────────────
+
+test('content revision follows the text and the reader\'s marks', () => {
   const a = article({ content_html: '<p>One.</p>' });
-  assert.equal(contentHash(a), contentHash({ ...a }));
-  assert.notEqual(contentHash(a), contentHash({ ...a, content_html: '<p>Two.</p>' }));
+  assert.equal(contentRevision(a), contentRevision({ ...a }));
+  assert.notEqual(contentRevision(a), contentRevision({ ...a, content_html: '<p>Two.</p>' }));
+  assert.notEqual(contentRevision(a), contentRevision({ ...a, content_html: '<p data-particle-speech="exclude">One.</p>' }));
+  assert.notEqual(contentRevision(a), contentRevision({ ...a, title: 'Another' }));
 });
 
-test('picking a voice swaps the voice and keeps the direction already written', async () => {
-  const reuse = {
-    voice_id: 'old-voice', voice_name: 'Old Voice', tone: 'essay', speed: 0.94,
-    temperature: 0.81, top_p: 0.7, pronunciations: [{ find: 'Nguyen', say: 'win' }],
-    reason: 'essay tone, warm', source: 'llm',
+test('script id moves with the segment policy; rev moves with every synthesis input but not playback rate', () => {
+  const a = article({ content_html: '<p>One.</p>' });
+  const { content_revision, script_id } = scriptIdentity(a);
+  assert.equal(script_id, scriptId(content_revision, 3, { target: 300, max: 450 }));
+  assert.notEqual(script_id, scriptIdentity(a, { policy: { target: 200, max: 200 } }).script_id);
+
+  const config = { model: 'm', bitrate: 64, speed: 1, endpoint: 'e' };
+  const base = narrationRev({ script_id, voice_id: 'v1', config });
+  assert.equal(base, narrationRev({ script_id, voice_id: 'v1', config: { endpoint: 'e', speed: 1, bitrate: 64, model: 'm' } }));
+  assert.notEqual(base, narrationRev({ script_id, voice_id: 'v2', config }));
+  assert.notEqual(base, narrationRev({ script_id, voice_id: 'v1', config: { ...config, bitrate: 128 } }));
+  assert.notEqual(base, narrationRev({ script_id, voice_id: null, config }));
+  assert.match(base, /^r[0-9a-f]{31}$/);
+});
+
+// ── older narrations ─────────────────────────────────────────────────────────
+
+test('an old seconds bookmark maps through its own script to the paragraph it named', () => {
+  const a = article({ content_html: '<p>First paragraph.</p><figure><figcaption>Cap.</figcaption></figure><p>Second paragraph, the one being heard.</p><p>Third.</p>' });
+  const legacy = {
+    content_hash: legacyContentHash(a),
+    direction: { speed: 1 },
+    script: { segments: [
+      { seq: 0, kind: 'intro', blocks: [], chars: 40, pause: 900 },
+      { seq: 1, kind: 'text', blocks: [0], chars: 20, pause: 460 },
+      { seq: 2, kind: 'caption', blocks: [1], chars: 4, pause: 460 },
+      { seq: 3, kind: 'text', blocks: [2], chars: 40, pause: 460 },
+      { seq: 4, kind: 'outro', blocks: [], chars: 20, pause: 0 },
+    ] },
   };
-  const { direction, script } = await planNarration(
-    article({ content_html: '<p>One sentence, read aloud.</p>' }),
-    { voiceId: 'new-voice', reuse },
-  );
-
-  assert.equal(direction.voice_id, 'new-voice');
-  assert.equal(direction.source, 'manual');
-  assert.equal(direction.speed, 0.94);
-  assert.deepEqual(direction.pronunciations, reuse.pronunciations);
-  // the pacing belongs to the article, the reason belonged to the voice it replaced
-  assert.match(direction.reason, /chosen by hand/);
-  assert.ok(script.segments.length > 0);
+  const durations = new Map([[0, 5], [1, 2], [3, 4]]);
+  const target = buildScript(a).segments[1].block_id;
+  assert.deepEqual(mapLegacyPosition(a, legacy, durations, 8), { block_id: target });
+  assert.deepEqual(mapLegacyPosition(a, legacy, durations, 2), { block_id: buildScript(a).segments[0].block_id });
+  assert.deepEqual(mapLegacyPosition(a, legacy, durations, 99), { completed: true });
 });
 
-test('a casting revision moves with the voice, the script and the rebuild', () => {
-  const base = { content_hash: 'abc', voice_id: 'one', created_at: '2026-08-27T00:00:00.000Z' };
-  assert.equal(narrationRev(base), narrationRev({ ...base }));
-  assert.notEqual(narrationRev(base), narrationRev({ ...base, voice_id: 'two' }));
-  assert.notEqual(narrationRev(base), narrationRev({ ...base, content_hash: 'def' }));
-  assert.notEqual(narrationRev(base), narrationRev({ ...base, created_at: '2026-08-27T00:00:01.000Z' }));
+test('an old bookmark on text that has since changed maps to nothing', () => {
+  const a = article({ content_html: '<p>First.</p>' });
+  const legacy = { content_hash: 'something-else', script: { segments: [{ seq: 0, kind: 'text', blocks: [0], chars: 6 }] } };
+  assert.equal(mapLegacyPosition(a, legacy, new Map(), 1), null);
 });

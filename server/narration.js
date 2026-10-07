@@ -1,163 +1,357 @@
-// Turns a saved article into a narration script: what gets read, in what order,
-// with what pacing — and which voice suits this particular piece. Nothing here
-// touches the database or the network except the voice catalogue and the
-// optional LLM that suggests a direction.
+// Turns a saved article into a narration script: which blocks are read, in what
+// order, cut into short passages, with what pacing. Pure: nothing here touches
+// the database, the network or a model. What is spoken is decided from the
+// article's own structure every time, so the same saved text always produces
+// the same script — and a cached passage is only reused when that holds.
 import { JSDOM } from 'jsdom';
 import { createHash } from 'node:crypto';
-import { listVoices, knownVoice, pinnedVoiceId, VOICE_LOCKED } from './tts.js';
-import { isLlmConfigured, directNarration } from './llm.js';
+import { contentRevision, scriptId, hashText } from './narration-identity.js';
 
-// Bump when the script builder changes shape; cached audio is rebuilt.
-export const SCRIPT_VERSION = 2;
+// Bump when what is spoken, or how it is cut, changes shape; audio is rebuilt.
+export const SCRIPT_VERSION = 3;
 
-const MAX_SEGMENT_CHARS = positiveInt(process.env.TTS_SEGMENT_CHARS, 1100);
-const MERGE_UNDER_CHARS = 260;
-const MERGE_CEILING_CHARS = 700;
+/* Every element that can own spoken text. Indices into this list are how the
+   reader finds the passage being spoken; the manifest carries the selector so
+   the browser runs the same query rather than keeping its own copy. */
+export const BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, blockquote, li, figcaption, pre, dt, dd, div, section, table';
 
-// Every block that can carry prose. Indices into this list are how the reader
-// finds the paragraph being spoken, so the client runs the same query.
-export const BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, blockquote, li, figcaption, pre, dt, dd';
+/* Passages are short: a voice switch repeats at most one of them, and the first
+   one arrives quickly. Sentences are kept whole up to `max`; a single sentence
+   longer than that is cut at clauses, then words. TTS_SEGMENT_CHARS caps it. */
+export const SEGMENT_POLICY = segmentPolicy(process.env.TTS_SEGMENT_CHARS);
 
-/* `pause` is milliseconds of silence appended to the segment's own audio, so the
+export function segmentPolicy(raw) {
+  const cap = positiveInt(raw, 0);
+  const max = cap ? Math.max(60, Math.min(cap, 2000)) : 450;
+  return { target: Math.min(300, max), max };
+}
+
+/* `pause` is milliseconds of silence appended to the passage's own audio, so the
    gap between passages survives a locked screen — a suspended phone stops
    running timers long before it stops playing a file. */
 const KIND_STYLE = {
-  intro:   { speed: 0.98, temperature: 0.60, volume: 0,  pause: 900 },
-  heading: { speed: 0.95, temperature: null, volume: 0,  pause: 800 },
-  text:    { speed: 1.00, temperature: null, volume: 0,  pause: 460 },
-  item:    { speed: 1.00, temperature: null, volume: 0,  pause: 320 },
-  quote:   { speed: 0.96, temperature: 0.06, volume: 0,  pause: 640 },  // temperature is a delta
-  caption: { speed: 1.02, temperature: null, volume: -2, pause: 460 },
-  outro:   { speed: 0.95, temperature: 0.55, volume: -1, pause: 0 },
+  heading: { speed: 0.95, temperature: null, volume: 0, pause: 800 },
+  text:    { speed: 1.00, temperature: null, volume: 0, pause: 460 },
+  item:    { speed: 1.00, temperature: null, volume: 0, pause: 320 },
+  quote:   { speed: 0.96, temperature: 0.06, volume: 0, pause: 640 },  // temperature is a delta
 };
-// Between two halves of one paragraph that was too long for a single request.
+// Between two passages of one paragraph that was too long for a single request.
 const SPLIT_PAUSE = 200;
 
-// ── the script ───────────────────────────────────────────────────────────────
+// ── what is spoken ───────────────────────────────────────────────────────────
+
+/* Never read aloud, wherever they appear. */
+const DROP = 'script, style, noscript, template, img, picture, svg, video, audio, iframe, object, embed, '
+  + 'source, math, canvas, button, input, select, textarea';
+export const SPEECH_CLASSES = { caption: 'speech-caption', credit: 'speech-credit', info: 'speech-info' };
+
+/* Reasons a block is left out that come from the article's structure or from
+   the reader's own mark. These are certain, and "read aloud" cannot undo them. */
+const CERTAIN = new Set(['manual', 'table', 'code', 'caption', 'credit', 'metadata']);
 
 /**
- * Walk the extracted article and decide what a person would actually want read
- * aloud: prose in order, headings with room to breathe, quotes set apart,
- * pullquotes that only repeat the body dropped, code and tables left out.
+ * Every block that owns text, in reading order, with whether it is spoken and,
+ * if not, why. Nothing is removed from the stored article: this is a reading
+ * of it, and the reader still sees every word.
+ *
+ * Each text node belongs to exactly one block — its nearest enclosing block
+ * element — so a quote's paragraphs, a nested list and bare prose sitting in a
+ * div around other paragraphs are each spoken once, in order. Bare text that a
+ * child paragraph interrupts becomes one block per run (`run`), so the words
+ * after the paragraph are not read before it.
  */
-export function buildScript(article, direction = {}) {
-  const html = String(article.content_html || '');
-  const dom = new JSDOM(`<body>${html}</body>`);
-  const doc = dom.window.document;
-  const nodes = [...doc.querySelectorAll(BLOCK_SELECTOR)];
+export function classifyNarrationBlocks(article, { document } = {}) {
+  const doc = document || new JSDOM(`<body>${String(article?.content_html || '')}</body>`).window.document;
+  const nodes = [...doc.body.querySelectorAll(BLOCK_SELECTOR)];
+  const indexOf = new Map(nodes.map((el, index) => [el, index]));
+  const units = collectUnits(doc, indexOf);
 
-  const blocks = [];
-  for (const [index, el] of nodes.entries()) {
-    // The outermost matching block owns the text; an inner <p> of a blockquote
-    // or a list item would otherwise be read twice.
-    if (el.parentElement?.closest(BLOCK_SELECTOR)) continue;
-    const kind = blockKind(el);
-    if (kind === 'code') {
-      blocks.push({ index, kind, text: '', skip: 'code' });
-      continue;
-    }
-    const text = speakable(blockText(el, dom.window), direction.pronunciations);
-    if (!hasSpeech(text)) {
-      blocks.push({ index, kind, text: '', skip: 'empty' });
-      continue;
-    }
-    blocks.push({ index, kind, text });
-  }
+  const blocks = units.map((unit) => {
+    const block = { el: unit.el, dom_index: unit.dom_index, run: unit.run, kind: kindOf(unit.el), raw: tidy(unit.text) };
+    const certain = certainReason(unit.el);
+    if (certain) block.skip_reason = certain;
+    block.include = !certain && includedByReader(unit.el);
+    block.text = certain ? '' : speakable(block.raw);
+    if (!certain && !hasSpeech(block.text)) block.skip_reason = 'empty';
+    return block;
+  });
 
-  dropDuplicatePullquotes(blocks);
-
-  const segments = [];
-  const push = (kind, text, blockIndices, { last = true } = {}) => {
-    const style = KIND_STYLE[kind] || KIND_STYLE.text;
-    segments.push({
-      seq: segments.length,
-      kind,
-      text,
-      blocks: blockIndices,
-      pause: last ? style.pause : SPLIT_PAUSE,
-      chars: text.length,
-    });
-  };
-
-  const intro = String(direction.intro ?? defaultIntro(article)).trim();
-  if (intro) push('intro', speakable(intro, direction.pronunciations), []);
-
-  const readable = blocks.filter(block => !block.skip);
-  for (let i = 0; i < readable.length; i++) {
-    const block = readable[i];
-    const merged = [block.index];
-    let text = block.text;
-
-    // Two short paragraphs in a row are one breath, not two requests.
-    while (
-      text.length < MERGE_UNDER_CHARS &&
-      (block.kind === 'text' || block.kind === 'item') &&
-      readable[i + 1]?.kind === block.kind &&
-      text.length + readable[i + 1].text.length <= MERGE_CEILING_CHARS
-    ) {
-      i += 1;
-      text = `${text} ${readable[i].text}`;
-      merged.push(readable[i].index);
-    }
-
-    const parts = splitForSynthesis(text);
-    parts.forEach((part, partIndex) => {
-      push(block.kind, part, merged, { last: partIndex === parts.length - 1 });
-    });
-  }
-
-  const outro = String(direction.outro ?? defaultOutro(article)).trim();
-  if (outro && readable.length) push('outro', speakable(outro, direction.pronunciations), []);
-
-  return {
-    version: SCRIPT_VERSION,
-    segments,
-    blocks: blocks.map(({ index, kind, skip }) => ({ index, kind, ...(skip ? { skip } : {}) })),
-  };
+  inferExclusions(blocks, article);
+  assignIds(blocks);
+  return blocks.map(({ el, raw, include, ...block }) => (block.skip_reason ? { ...block, text: '' } : block));
 }
 
-function blockKind(el) {
+/* Walk the body once, in document order, filing each run of text under the
+   block element that owns it. */
+function collectUnits(doc, indexOf) {
+  const units = [];
+  const open = new Map();     // owner → its unit being filled
+  const emit = (owner, text) => {
+    if (!owner || !text) return;
+    let unit = open.get(owner);
+    if (!unit) {
+      unit = { el: owner, dom_index: indexOf.get(owner), text: '' };
+      units.push(unit);
+      open.set(owner, unit);
+    }
+    unit.text += text;
+  };
+  const visit = (node, owner) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) { emit(owner, child.data); continue; }
+      if (child.nodeType !== 1) continue;
+      const tag = child.tagName.toLowerCase();
+      if (child.matches(DROP)) continue;
+      if (tag === 'br' || tag === 'hr') { emit(owner, ' '); continue; }
+      if (tag === 'sup' && isFootnoteMarker(child)) continue;
+      if (indexOf.has(child)) {
+        // a block inside a block: it owns its own words, and the outer block's
+        // words after it are a new run, read after it
+        if (owner) open.delete(owner);
+        visit(child, child);
+        open.delete(child);
+        continue;
+      }
+      if (tag === 'a') {
+        const label = (child.textContent || '').trim();
+        if (/^https?:\/\/\S+$/i.test(label)) { emit(owner, ` ${sayDomain(label)} `); continue; }
+      }
+      // an inline credit or a reader's mark inside a paragraph drops just those words
+      if (inlineExcluded(child)) { emit(owner, ' '); continue; }
+      visit(child, owner);
+    }
+  };
+  visit(doc.body, null);
+
+  // runs are counted only once they carry words, so whitespace between child
+  // blocks does not shift the numbering
+  const kept = units.filter(unit => /[\p{L}\p{N}]/u.test(unit.text)
+    || (/\S/.test(unit.text) && certainReason(unit.el)));
+  const runs = new Map();
+  for (const unit of kept) {
+    unit.run = runs.get(unit.el) || 0;
+    runs.set(unit.el, unit.run + 1);
+  }
+  return kept;
+}
+
+function kindOf(el) {
   const tag = el.tagName.toLowerCase();
   if (/^h[1-6]$/.test(tag)) return 'heading';
-  if (tag === 'blockquote') return 'quote';
-  if (tag === 'figcaption') return 'caption';
-  if (tag === 'pre') return 'code';
+  if (el.closest('blockquote')) return 'quote';
   if (tag === 'li' || tag === 'dt' || tag === 'dd') return 'item';
   return 'text';
 }
 
-/* Text as a listener would want it: footnote markers gone, a bare link read as
-   its domain rather than spelled out character by character. */
-function blockText(el, window) {
+/* Structure and the reader's own mark, walking out from the block. A reader's
+   "skip" anywhere above wins; otherwise the nearest structural reason does. */
+function certainReason(el) {
+  for (let node = el; node && node.tagName !== 'BODY'; node = node.parentElement) {
+    if (node.getAttribute('data-particle-speech') === 'exclude') return 'manual';
+  }
+  for (let node = el; node && node.tagName !== 'BODY'; node = node.parentElement) {
+    const tag = node.tagName.toLowerCase();
+    if (['table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption'].includes(tag)) return 'table';
+    if (tag === 'pre') return 'code';
+    if (tag === 'figcaption' || node.classList.contains(SPEECH_CLASSES.caption)) return 'caption';
+    if (node.classList.contains(SPEECH_CLASSES.credit)) return 'credit';
+    if (node.classList.contains(SPEECH_CLASSES.info)) return 'metadata';
+  }
+  if (codeOnly(el)) return 'code';
+  return null;
+}
+
+function includedByReader(el) {
+  const marked = el.closest('[data-particle-speech]');
+  return marked?.getAttribute('data-particle-speech') === 'include';
+}
+
+/* An author's name linked inside a sentence is part of the sentence; a credit
+   tacked onto the end of one is not. */
+function inlineExcluded(el) {
+  if (el.getAttribute('data-particle-speech') === 'exclude') return true;
+  return el.classList.contains(SPEECH_CLASSES.caption) || el.classList.contains(SPEECH_CLASSES.credit);
+}
+
+/* A block that is nothing but code is a listing, even without a <pre>. Inline
+   code inside a sentence stays: dropping it would leave the sentence broken. */
+function codeOnly(el) {
+  if (!el.querySelector('code')) return false;
   const clone = el.cloneNode(true);
-  for (const sup of clone.querySelectorAll('sup')) {
-    if (/^[\s\d,\-–[\]a-z*†‡]{1,8}$/i.test(sup.textContent || '')) sup.remove();
-  }
-  for (const anchor of clone.querySelectorAll('a')) {
-    const label = (anchor.textContent || '').trim();
-    if (/^https?:\/\/\S+$/i.test(label)) {
-      anchor.replaceWith(window.document.createTextNode(sayDomain(label)));
-    }
-  }
-  return clone.textContent || '';
+  for (const code of clone.querySelectorAll('code')) code.remove();
+  for (const inner of clone.querySelectorAll(BLOCK_SELECTOR)) inner.remove();
+  return !/[\p{L}\p{N}]/u.test(clone.textContent || '');
 }
 
-// A pullquote is the body text again in a bigger font. Reading it twice is the
-// single most jarring thing a naive reader-aloud does.
-function dropDuplicatePullquotes(blocks) {
-  const body = blocks.filter(b => !b.skip && b.kind === 'text').map(b => flatten(b.text)).join(' ');
-  if (!body) return;
+function isFootnoteMarker(sup) {
+  return /^[\s\d,\-–[\]a-z*†‡]{1,8}$/i.test(sup.textContent || '');
+}
+
+// ── inferred exclusions ──────────────────────────────────────────────────────
+/* Unlabelled structure has to be recognised from the text, which is never
+   certain. These rules only ever match a whole short block — a paragraph that
+   merely mentions a photo, a date or a byline is prose and is read. Each is
+   marked `inferred`, which is what "read aloud" on that block can undo. */
+
+const MONTHS = 'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
+const DATE_CORE = `(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\\s+)?(?:(?:${MONTHS})\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?,?(?:\\s+\\d{4})?|\\d{1,2}(?:st|nd|rd|th)?\\s+(?:${MONTHS})\\.?,?(?:\\s+\\d{4})?|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}[./]\\d{1,2}[./]\\d{2,4})`;
+const TIME = '(?:[,\\s]+(?:at\\s+)?\\d{1,2}[:.]\\d{2}(?:\\s*[ap]\\.?m\\.?)?(?:\\s+[a-z]{2,5})?)?';
+const DATE_LINE = new RegExp(`^(?:(?:first\\s+|last\\s+)?(?:published|updated|posted|modified)(?:\\s+on)?:?\\s+)?${DATE_CORE}${TIME}\\.?$`, 'i');
+const READING_TIME = /^(?:about\s+)?\d{1,3}\s*(?:-|to)?\s*(?:\d{1,3}\s*)?(?:min|mins|minutes?)(?:\s+(?:read|listen))?\.?$/i;
+// names are capitalised; "written by hand, the caption…" is a sentence, not a byline
+const NAME = "(?:\\p{Lu}[\\p{L}.'’-]*|de|da|del|van|von|der|den|la|le|al|bin|ibn)";
+const BYLINE = new RegExp(`^(?:[Bb]y|[Ww]ords by|[Ww]ritten by|[Ss]tory by|[Rr]eporting by)\\s+${NAME}(?:(?:\\s+|,\\s*|\\s+and\\s+|\\s*&\\s*)${NAME}){0,6}\\.?$`, 'u');
+const CREDIT = /^\(?\s*(?:(?:photo(?:graph)?s?|images?|illustrations?|pictures?|graphics?|video|map|chart|artwork)(?:\s+credits?)?\s*(?::|by\b|courtesy\b|via\b|[–—-]\s)|credits?\s*:|source\s*:|©|\(c\)\s|copyright\s|(?:getty images|ap photo|reuters|afp|epa|shutterstock|alamy|ap)\s*(?:\/|$|:|\)))/i;
+const BOILERPLATE = /^(?:share(?:\s+this)?(?:\s+(?:article|story|post|page))?|share on [\w ]{1,20}|subscribe(?:\s+(?:now|today|here))?|sign up(?: for| to)?(?: (?:our|the))?(?: free)?(?: daily| weekly)? newsletters?|advertisement|sponsored(?: content)?|related(?: articles| stories| content| reading| coverage)?|read more|read next|continue reading|more from [\w ]{1,40}|follow us(?: on [\w ]{1,20})?|listen to (?:this )?(?:article|story)|skip advert(?:isement)?|print(?: this)?(?: article)?|email(?: this)?(?: article)?|comments?)\s*[.:!]?$/i;
+
+function inferExclusions(blocks, article) {
+  const title = canonical(article?.title);
+  const site = canonical(article?.site_name);
+  const byline = canonical(article?.byline);
+  const bylineBare = canonical(String(article?.byline || '').replace(/^\s*by\s+/i, ''));
+
+  // The opening: everything before the first paragraph of real prose. Bylines
+  // and datelines repeated by the extraction live here and nowhere else; the
+  // title, only before anything has been spoken at all.
+  let leading = true;
+  let spokenSoFar = 0;
   for (const block of blocks) {
-    if (block.skip || block.kind !== 'quote') continue;
-    const needle = flatten(block.text);
-    if (needle.length >= 40 && body.includes(needle)) {
-      block.skip = 'duplicate';
-      block.text = '';
+    if (block.skip_reason) continue;
+    const text = block.raw;
+    if (!block.include) {
+      const flat = canonical(text);
+      if (!spokenSoFar && title && flat === title) { infer(block, 'title'); continue; }
+      if (leading && isMetadataLine(text, { site, byline, bylineBare })) { infer(block, 'metadata'); continue; }
+      if (text.length <= 160 && CREDIT.test(text.trim()) && nearImage(block.el)) { infer(block, 'credit'); continue; }
+      if (text.length <= 60 && BOILERPLATE.test(text.trim())) { infer(block, 'boilerplate'); continue; }
+    }
+    if (block.kind === 'text' && wordCount(text) >= 12) leading = false;
+    spokenSoFar += 1;
+  }
+
+  // A pullquote is the body again in a bigger font. Reading it twice is the
+  // single most jarring thing a naive reader-aloud does.
+  const body = blocks.filter(b => !b.skip_reason && b.kind !== 'quote').map(b => flatten(b.text)).join(' ');
+  if (body) {
+    for (const block of blocks) {
+      if (block.skip_reason || block.kind !== 'quote' || block.include) continue;
+      const needle = flatten(block.text);
+      if (needle.length >= 40 && body.includes(needle)) infer(block, 'duplicate');
     }
   }
 }
 
-const flatten = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+function infer(block, reason) {
+  block.skip_reason = reason;
+  block.inferred = true;
+}
+
+function isMetadataLine(text, { site, byline, bylineBare }) {
+  const line = text.trim();
+  if (!line || line.length > 160) return false;
+  const pieces = line.split(/\s*[·•|]\s*|\s+[–—]\s+/).filter(Boolean);
+  return pieces.every((piece) => {
+    const flat = canonical(piece);
+    if (!flat) return true;
+    if (site && flat === site) return true;
+    if (byline && (flat === byline || flat === bylineBare || flat === canonical(`by ${bylineBare}`))) return true;
+    if (piece.length <= 80 && BYLINE.test(piece)) return true;
+    if (piece.length <= 70 && DATE_LINE.test(piece)) return true;
+    return READING_TIME.test(piece);
+  });
+}
+
+/* A credit line is only taken for one when it sits with a picture: inside the
+   figure, or straight after (or before) an image. */
+function nearImage(el) {
+  if (el.closest('figure')) return true;
+  const isImage = node => Boolean(node) && (node.matches('img, picture, figure')
+    || (Boolean(node.querySelector('img, picture')) && !/[\p{L}\p{N}]/u.test(node.textContent || '')));
+  return isImage(el.previousElementSibling) || isImage(el.nextElementSibling);
+}
+
+// ── identity ─────────────────────────────────────────────────────────────────
+/* A block is named by its own words and which occurrence of them it is, so a
+   bookmark on a paragraph survives edits elsewhere in the article. Positions in
+   the DOM change with every edit and are only used to find the element. */
+function assignIds(blocks) {
+  const seen = new Map();
+  for (const block of blocks) {
+    const key = hashText(canonical(block.raw) || `${block.kind}:${block.dom_index}`);
+    const occurrence = seen.get(key) || 0;
+    seen.set(key, occurrence + 1);
+    block.id = `b${key}-${occurrence}`;
+  }
+}
+
+// ── the script ───────────────────────────────────────────────────────────────
+
+/**
+ * The spoken script: one or more short passages per spoken block, never one
+ * passage across two blocks, with the offsets of each passage in the block's
+ * spoken text. Excluded blocks stay in `blocks` with their reason, so the
+ * reader can be told why a paragraph is silent.
+ */
+export function buildScript(article, { policy = SEGMENT_POLICY } = {}) {
+  const blocks = classifyNarrationBlocks(article);
+  const segments = [];
+  for (const block of blocks) {
+    if (block.skip_reason) continue;
+    const parts = splitForSynthesis(block.text, policy);
+    parts.forEach((piece, part) => {
+      const style = KIND_STYLE[block.kind] || KIND_STYLE.text;
+      segments.push({
+        id: `${block.id}.${part}`,
+        seq: segments.length,
+        block_id: block.id,
+        dom_index: block.dom_index,
+        run: block.run,
+        part,
+        kind: block.kind,
+        text: piece.text,
+        start: piece.start,
+        end: piece.end,
+        pause: part === parts.length - 1 ? style.pause : SPLIT_PAUSE,
+        chars: piece.text.length,
+      });
+    });
+  }
+  return {
+    version: SCRIPT_VERSION,
+    policy: normalisePolicy(policy),
+    selector: BLOCK_SELECTOR,
+    segments,
+    blocks: blocks.map(({ text, ...block }) => block),
+  };
+}
+
+/** The identities a script is filed under, without building audio. */
+export function scriptIdentity(article, { policy = SEGMENT_POLICY } = {}) {
+  const content_revision = contentRevision(article);
+  return { content_revision, script_id: scriptId(content_revision, SCRIPT_VERSION, normalisePolicy(policy)) };
+}
+
+/* How the passages are delivered. Fixed, apart from easing off on a long read:
+   it depends only on the saved text, so the same article always sounds the
+   same, and changing it is a change of revision rather than a surprise. */
+export function pacing(article) {
+  return { speed: (article?.word_count || 0) > 2500 ? 0.97 : 1, temperature: 0.7, top_p: 0.7 };
+}
+
+/** Per-passage delivery: a heading slows down, a quote loosens. */
+export function segmentStyle(kind, direction) {
+  const style = KIND_STYLE[kind] || KIND_STYLE.text;
+  const baseSpeed = Number(direction?.speed) || 1;
+  const baseTemperature = Number(direction?.temperature);
+  const base = Number.isFinite(baseTemperature) ? baseTemperature : 0.7;
+  const temperature = kind === 'quote' ? base + style.temperature : (style.temperature ?? base);
+  return {
+    speed: clamp(baseSpeed * style.speed, 0.5, 2),
+    temperature: clamp(temperature, 0.1, 1),
+    topP: clamp(Number(direction?.top_p) || 0.7, 0.1, 1),
+    volume: style.volume,
+  };
+}
 
 // ── speech normalisation ─────────────────────────────────────────────────────
 
@@ -277,71 +471,90 @@ function sayDomain(url) {
 
 const hasSpeech = text => /[\p{L}\p{N}]/u.test(text);
 
-/* Long paragraphs are split on sentence boundaries so no single request runs
-   away, and so the pause lands where the writer put a full stop. */
-export function splitForSynthesis(text, max = MAX_SEGMENT_CHARS) {
-  if (text.length <= max) return [text];
-  const sentences = text.split(/(?<=[.!?…]["'”’)\]]?)\s+/);
-  const parts = [];
-  let current = '';
-  const flush = () => { if (current.trim()) parts.push(current.trim()); current = ''; };
+/* Text is cut into passages near `target` characters, on sentence boundaries,
+   so the pause lands where the writer put a full stop. A sentence up to `max`
+   stays whole; a longer one is cut at clauses, then between words, and only a
+   single unbroken token longer than `max` is ever cut mid-word. Each passage
+   keeps its offsets into the block's spoken text, and joining the passages
+   with single spaces gives that text back exactly. */
+export function splitForSynthesis(text, policy = SEGMENT_POLICY) {
+  const { target, max } = normalisePolicy(policy);
+  const source = String(text || '');
+  if (!source) return [];
+  if (source.length <= target) return [{ text: source, start: 0, end: source.length }];
 
-  for (const sentence of sentences) {
-    if (sentence.length > max) {
+  const pieces = [];
+  let current = null;
+  const flush = () => { if (current) pieces.push(current); current = null; };
+  for (const sentence of spans(source, 0, source.length, /(?<=[.!?…]["'”’)\]]?)\s+/g)) {
+    if (sentence.end - sentence.start > max) {
       flush();
-      for (const piece of hardSplit(sentence, max)) parts.push(piece);
+      pieces.push(...cutLong(source, sentence, target, max));
       continue;
     }
-    if (current && current.length + sentence.length + 1 > max) flush();
-    current = current ? `${current} ${sentence}` : sentence;
+    if (current && sentence.end - current.start > target) flush();
+    current = current ? { start: current.start, end: sentence.end } : sentence;
   }
   flush();
-  return parts.length ? parts : [text.slice(0, max)];
+  return pieces.map(({ start, end }) => ({ text: source.slice(start, end), start, end }));
 }
 
-function hardSplit(sentence, max) {
-  const parts = [];
-  let current = '';
-  for (const clause of sentence.split(/(?<=[,;:])\s+/)) {
-    if (current && current.length + clause.length + 1 > max) { parts.push(current.trim()); current = ''; }
-    if (clause.length > max) {
-      if (current.trim()) parts.push(current.trim());
-      current = '';
-      for (let at = 0; at < clause.length; at += max) parts.push(clause.slice(at, at + max).trim());
+/* The separator-delimited stretches of text[from, to), as offsets. */
+function spans(text, from, to, separator) {
+  const out = [];
+  const slice = text.slice(from, to);
+  let at = 0;
+  for (const match of slice.matchAll(separator)) {
+    if (match.index > at) out.push({ start: from + at, end: from + match.index });
+    at = match.index + match[0].length;
+  }
+  if (at < slice.length) out.push({ start: from + at, end: to });
+  return out;
+}
+
+function cutLong(text, range, target, max) {
+  const pieces = [];
+  let current = null;
+  const flush = () => { if (current) pieces.push(current); current = null; };
+  for (const clause of spans(text, range.start, range.end, /(?<=[,;:])\s+/g)) {
+    if (clause.end - clause.start > max) {
+      flush();
+      pieces.push(...cutWords(text, clause, max));
       continue;
     }
-    current = current ? `${current} ${clause}` : clause;
+    if (current && clause.end - current.start > target) flush();
+    current = current ? { start: current.start, end: clause.end } : clause;
   }
-  if (current.trim()) parts.push(current.trim());
-  return parts.filter(Boolean);
+  flush();
+  return pieces;
 }
 
-// ── framing ──────────────────────────────────────────────────────────────────
-
-function defaultIntro(article) {
-  const parts = [];
-  if (article.site_name) parts.push(cleanSpoken(article.site_name));
-  if (article.title) parts.push(cleanSpoken(article.title));
-  const byline = cleanByline(article.byline);
-  if (byline) parts.push(`By ${byline}`);
-  const minutes = readingMinutes(article);
-  if (minutes) parts.push(`${minutes} minute${minutes === 1 ? '' : 's'}`);
-  return parts.join('. ');
+function cutWords(text, range, max) {
+  const pieces = [];
+  let start = range.start;
+  while (range.end - start > max) {
+    const window = text.slice(start, start + max + 1);
+    const space = window.lastIndexOf(' ');
+    if (space > 0) {
+      pieces.push({ start, end: start + space });
+      start += space + 1;
+    } else {
+      // one token longer than a whole passage: the last resort
+      pieces.push({ start, end: start + max });
+      start += max;
+    }
+  }
+  if (start < range.end) pieces.push({ start, end: range.end });
+  return pieces;
 }
 
-function defaultOutro(article) {
-  return article.site_name ? `End of article, from ${cleanSpoken(article.site_name)}.` : 'End of article.';
+function normalisePolicy(policy) {
+  if (typeof policy === 'number') return { target: Math.min(300, policy), max: policy };
+  const max = positiveInt(policy?.max, 450);
+  return { target: Math.min(positiveInt(policy?.target, 300), max), max };
 }
 
-function cleanByline(byline) {
-  const value = cleanSpoken(byline).replace(/^by\s+/i, '').split(/\s*[|·•]\s*/)[0].trim();
-  return value.length > 1 && value.length <= 80 ? value : '';
-}
-
-const cleanSpoken = value => String(value || '').replace(/\s+/g, ' ').trim();
-export const readingMinutes = article => Math.max(1, Math.round((article.word_count || 0) / 230));
-
-// ── voice ────────────────────────────────────────────────────────────────────
+// ── automatic voice ────────────────────────────────────────────────────────────────────
 
 /* What a piece asks for out loud. A market report and a personal essay want
    different narrators, and the tags the library already stores say which.
@@ -459,16 +672,6 @@ function scoreVoice(voice, { wanted, clashing, recent, seed }) {
 
 const voiceKey = voice => String(voice.title || voice.id).toLowerCase().replace(/[^a-z0-9]+/g, '');
 
-/* What the panel says about the casting when no model wrote a reason. The
-   voice's own labels are the honest answer: they are what it was picked on. */
-export function castingReason(voice, profile) {
-  if (!voice) return `${profile.id} tone, chosen from the article's subject and length`;
-  const wanted = new Set(profile.want);
-  const qualities = (voice.tags || []).filter(tag => wanted.has(tag) || READS_PROSE.has(tag)).slice(0, 3);
-  if (!qualities.length) return `${profile.id} tone, chosen from the article's subject and length`;
-  return `${qualities.join(', ')} — cast for a ${profile.id} piece`;
-}
-
 export function detectLanguage(text = '') {
   const sample = String(text).slice(0, 4000);
   const count = pattern => (sample.match(pattern) || []).length;
@@ -481,148 +684,76 @@ export function detectLanguage(text = '') {
   return 'en';
 }
 
-// ── direction ────────────────────────────────────────────────────────────────
 
-/**
- * Decide how this one article should sound, then write the script for it.
- * With an LLM configured the choice of voice, pace and awkward-word
- * pronunciations comes from reading the piece; without one the tags and the
- * catalogue's own labels do the work.
- *
- * `reuse` is the direction of a narration of this same text. When the reader
- * picks a voice there is nothing left to decide — the pacing and the awkward
- * words belong to the article, not to whoever reads it — so the direction is
- * carried over and no model is asked again. That is what makes a swap quick.
- */
-export async function planNarration(article, { voiceId, reuse, avoid = [], onStage = () => {} } = {}) {
-  const language = detectLanguage(article.text_content || '');
-  const profile = toneProfile(article);
+// ── older narrations ─────────────────────────────────────────────────────────
+/* Before script v3 a narration was one cumulative clock with an intro line in
+   front and merged paragraphs, and the bookmark was seconds on that clock. The
+   seconds only mean something against the exact script they were measured on,
+   so they are converted once, through that script, to the paragraph they
+   pointed at — or not at all. */
+const LEGACY_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, blockquote, li, figcaption, pre, dt, dd';
+const LEGACY_RATE = { intro: 9, outro: 9, heading: 12, caption: 14 };
+const LEGACY_SPEED = { intro: 0.98, heading: 0.95, text: 1, item: 1, quote: 0.96, caption: 1.02, outro: 0.95 };
 
-  if (voiceId && reuse && !VOICE_LOCKED) {
-    onStage('casting', { detail: 'keeping the direction, swapping the voice' });
-    // The pacing and the awkward words belong to the article and carry over.
-    // The reason does not: it described the voice that was just replaced.
-    const chosen = knownVoice(voiceId);
-    const direction = {
-      ...reuse,
-      voice_id: voiceId,
-      voice_name: await voiceTitle(voiceId, language),
-      source: 'manual',
-      reason: chosen ? `${castingReason(chosen, profile)}, chosen by hand` : 'chosen by hand',
-    };
-    onStage('script', { detail: 'rebuilding the script' });
-    return { direction, script: buildScript(article, direction), language, contentHash: contentHash(article) };
-  }
-
-  onStage('catalogue', { detail: 'looking over the voice catalogue' });
-  const voices = VOICE_LOCKED ? [] : await listVoices(language);
-  const ranked = shortlistVoices(article, voices, profile, { avoid });
-  onStage('casting', {
-    detail: `${ranked.length} voice${ranked.length === 1 ? '' : 's'} ranked for a ${profile.id} piece`,
-  });
-
-  const direction = {
-    voice_id: pinnedVoiceId || ranked[0]?.id || null,
-    voice_name: pinnedVoiceId ? knownVoice(pinnedVoiceId)?.title || 'pinned voice' : ranked[0]?.title || 'default voice',
-    tone: profile.id,
-    speed: profile.speed,
-    temperature: profile.temperature,
-    top_p: 0.7,
-    pronunciations: [],
-    reason: castingReason(ranked[0], profile),
-    source: 'heuristic',
-  };
-
-  if (isLlmConfigured && !VOICE_LOCKED) {
-    onStage('directing', { detail: 'reading the article to cast it' });
-    try {
-      applySuggestion(direction, await directNarration({
-        article,
-        language,
-        profile: profile.id,
-        minutes: readingMinutes(article),
-        candidates: ranked.slice(0, 16).map(voice => ({
-          id: voice.id,
-          title: voice.title,
-          tags: voice.tags.slice(0, 8).join(', '),
-          description: voice.description.slice(0, 140),
-        })),
-      }), ranked);
-    } catch (error) {
-      console.error(`narration direction for #${article.id} failed:`, error.message);
-      onStage('directing', { detail: 'the model did not answer — casting on the article\'s own tags' });
-    }
-  }
-
-  if (voiceId) {
-    direction.voice_id = voiceId;
-    direction.voice_name = voices.find(voice => voice.id === voiceId)?.title
-      || knownVoice(voiceId)?.title || 'chosen voice';
-    direction.source = 'manual';
-  }
-  if (VOICE_LOCKED) {
-    direction.voice_id = pinnedVoiceId;
-    direction.voice_name = knownVoice(pinnedVoiceId)?.title || 'pinned voice';
-    direction.source = 'pinned';
-  }
-
-  onStage('script', { detail: 'writing the script' });
-  return { direction, script: buildScript(article, direction), language, contentHash: contentHash(article) };
-}
-
-async function voiceTitle(voiceId, language) {
-  const known = knownVoice(voiceId);
-  if (known?.title) return known.title;
-  try {
-    return (await listVoices(language)).find(voice => voice.id === voiceId)?.title || 'chosen voice';
-  } catch {
-    return 'chosen voice';
-  }
-}
-
-function applySuggestion(direction, suggested, ranked) {
-  if (!suggested) return;
-  const picked = ranked.find(voice => voice.id === suggested.voice_id);
-  if (picked) {
-    direction.voice_id = picked.id;
-    direction.voice_name = picked.title;
-  }
-  if (Number.isFinite(suggested.speed)) direction.speed = clamp(suggested.speed, 0.7, 1.25);
-  if (Number.isFinite(suggested.temperature)) direction.temperature = clamp(suggested.temperature, 0.3, 0.95);
-  if (typeof suggested.tone === 'string' && suggested.tone.trim()) direction.tone = suggested.tone.trim().slice(0, 40);
-  if (typeof suggested.intro === 'string' && suggested.intro.trim()) direction.intro = suggested.intro.trim().slice(0, 240);
-  if (typeof suggested.reason === 'string' && suggested.reason.trim()) direction.reason = suggested.reason.trim().slice(0, 200);
-  if (Array.isArray(suggested.pronunciations)) {
-    direction.pronunciations = suggested.pronunciations
-      .filter(entry => entry && typeof entry.find === 'string' && typeof entry.say === 'string')
-      .slice(0, 12)
-      .map(entry => ({ find: entry.find.trim().slice(0, 40), say: entry.say.trim().slice(0, 60) }))
-      .filter(entry => entry.find && entry.say);
-  }
-  direction.source = 'llm';
-}
-
-/** Cached audio belongs to one rendering of one article; this is that identity. */
-export function contentHash(article) {
+/** The hash the v2 script builder filed its narration under. */
+export function legacyContentHash(article) {
   return createHash('sha1')
-    .update(`${SCRIPT_VERSION} ${article.title || ''} ${article.byline || ''} ${article.content_html || ''}`)
+    .update(`2 ${article.title || ''} ${article.byline || ''} ${article.content_html || ''}`)
     .digest('hex');
 }
 
-/** Per-segment delivery: a heading slows down, a quote loosens, a caption drops back. */
-export function segmentStyle(kind, direction) {
-  const style = KIND_STYLE[kind] || KIND_STYLE.text;
-  const baseSpeed = Number(direction?.speed) || 1;
-  const baseTemperature = Number(direction?.temperature);
-  const base = Number.isFinite(baseTemperature) ? baseTemperature : 0.7;
-  const temperature = kind === 'quote' ? base + style.temperature : (style.temperature ?? base);
-  return {
-    speed: clamp(baseSpeed * style.speed, 0.5, 2),
-    temperature: clamp(temperature, 0.1, 1),
-    topP: clamp(Number(direction?.top_p) || 0.7, 0.1, 1),
-    volume: style.volume,
-  };
+/**
+ * Where an old bookmark points in today's script: `{ block_id }`, `{ completed }`,
+ * or null when it cannot be known. `durations` maps old segment numbers to the
+ * measured length of audio that was synthesised for them.
+ */
+export function mapLegacyPosition(article, legacy, durations, seconds) {
+  if (!legacy?.script?.segments?.length || !(seconds > 0)) return null;
+  if (legacy.content_hash !== legacyContentHash(article)) return null;
+
+  const speed = Number(legacy.direction?.speed) || 1;
+  let at = 0;
+  let found = null;
+  for (const segment of legacy.script.segments) {
+    // the old player never spoke captions unless asked, and never counted them
+    if (segment.kind === 'caption') continue;
+    const measured = durations.get(segment.seq);
+    const length = Number.isFinite(measured) ? measured
+      : (segment.chars || 0) / ((LEGACY_RATE[segment.kind] || 15.5) * speed * (LEGACY_SPEED[segment.kind] || 1))
+        + (segment.pause || 0) / 1000;
+    if (seconds < at + length) { found = segment; break; }
+    at += length;
+  }
+  if (!found || found.kind === 'outro') return { completed: true };
+
+  const dom = new JSDOM(`<body>${String(article.content_html || '')}</body>`);
+  const doc = dom.window.document;
+  const blocks = classifyNarrationBlocks(article, { document: doc });
+  const spoken = blocks.filter(block => !block.skip_reason);
+  if (!spoken.length) return null;
+  if (found.kind === 'intro' || !found.blocks?.length) return { block_id: spoken[0].id };
+
+  const target = doc.body.querySelectorAll(LEGACY_SELECTOR)[found.blocks[0]];
+  if (!target) return null;
+  const nodes = [...doc.body.querySelectorAll(BLOCK_SELECTOR)];
+  // the first spoken block at or after the old one, in document order
+  for (const block of spoken) {
+    const el = nodes[block.dom_index];
+    if (!el) continue;
+    if (el === target || target.contains(el)
+      || (target.compareDocumentPosition(el) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING)) {
+      return { block_id: block.id };
+    }
+  }
+  return null;
 }
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+const flatten = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+const canonical = s => String(s || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+const tidy = s => String(s || '').replace(/\s+/g, ' ').trim();
+const wordCount = s => (String(s).match(/[\p{L}\p{N}]+/gu) || []).length;
 
 function hashNumber(value) {
   let hash = 2166136261;

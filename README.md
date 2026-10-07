@@ -281,38 +281,43 @@ on trim mode:
 - Saved articles can be read offline.
 
 ### Optional Narration (read aloud)
-- Adds a **listen** button to the reader, with a player that follows along.
-- Writes a spoken script from the article rather than reading the raw text:
-  - Headings, quotes and list items each get their own pacing and pause, and the
-    pause is silence inside the audio, so it survives a locked phone.
-  - Image captions are left out by default; the player can turn them back on.
-  - Pullquotes that only repeat the body are dropped, so nothing is read twice.
-  - Code blocks and tables are skipped instead of spelled out.
-  - Footnote markers vanish; links are read as their domain, not character by character.
+- Adds **listen** to the reader. The button says what it will do: *listen* on a
+  new article, *resume* where you stopped, *listen again* once you have finished.
+  *Start over* is beside it.
+- Reads the article, not the page around it:
+  - Captions, image credits, bylines, datelines, reading times, share and
+    subscribe lines, tables, code, footnote markers and pullquotes that repeat
+    the body are never spoken. There is no opening or closing announcement;
+    title, author and site stay on the screen and the lock screen.
+  - Excluded text stays on the page, a shade quieter while you listen.
+  - Unlabelled captions cannot all be recognised. Select any paragraph and
+    choose *skip when reading aloud* (or *read this aloud* to undo a guess).
+    The mark is saved with the article.
   - `12%`, `$1.2bn`, `e.g.`, `2019–2024` and em dashes are said the way a person would.
-- Casts a voice per article from the provider's catalogue — subject, length and
-  the article's own tags decide the register. A voice is ranked on how much of
-  that register it covers *and* how much of the voice that register is, so a
-  narrator tagged fourteen ways stops matching everything, and the voices the
-  library heard most recently give way to ones it has not. With an LLM key
-  configured it also writes the spoken opening line and a pronunciation list for
-  the names, acronyms and product names in *that* article.
-- Speaks an opening line: publication, title, author, running time.
-- Playback: scrub bar, 15-second skips, speeds from 0.85× to 2×, and a resume
-  point synced with the rest of the library.
-- Keeps playing with the screen locked, including as a home-screen app: lock-screen
-  and headphone controls, a lock-screen scrub bar over the whole article, and
-  nothing between passages that a suspended phone could fail to run.
-- Tap any paragraph to start reading from there; the paragraph being spoken is
-  highlighted and scrolls into view.
-- Synthesis follows playback, so an article you abandon after a paragraph costs a
-  paragraph. Audio is cached in the same SQLite file and replays for free.
-- Voices can be swapped, or the whole narration recast, from the player. The
-  picker offers the voices that suit the article first, then the rest of the
-  catalogue.
-- Says what it is doing while it does it: casting, ranking, writing the script,
-  reading a passage — streamed from the server as it happens, with the seconds
-  counted once a step runs long, so a wait is never an unexplained pause.
+- Start anywhere: select text and choose *listen from here*, press `l` with text
+  selected, or *listen from visible paragraph* in the article menu (`L`).
+- One voice, chosen by you: a **default voice** for the library in settings
+  (searchable, with samples, shared by every device), or *Automatic*, which picks
+  once per article and keeps it. Any article can have its own voice from the
+  player; *use default* puts it back. The player says where the voice came from.
+- Switching voice stops the old one at once and starts the new one at the same
+  passage, paused or playing as you were.
+- The bookmark is a passage, not a number of seconds: resuming in the same voice
+  continues to the second, another voice restarts the current short passage, and
+  an edited article resumes at the same paragraph if it is still there. It is
+  saved on this device every couple of seconds and on the server every few, and
+  if two devices disagree you choose which place to keep.
+- When something goes wrong the passage stays where it is with *retry*, *choose
+  voice* and *skip passage*. Nothing is skipped on its own, and a player that
+  cannot play says so instead of showing a pause button over silence.
+- Synthesis follows playback, a little ahead of it, and stops for passages you
+  are no longer heading towards. Audio is cached in the same SQLite file under a
+  byte ceiling; a voice you return to plays from the cache.
+- *Download for offline listening* (player panel, or the article menu) keeps an
+  article's audio in this browser. A downloaded article plays with no
+  connection. Browsers may still clear stored data when they need room.
+- Keeps playing with the screen locked as far as the browser allows, with
+  lock-screen and headphone controls. See [narration on phones](#narration-on-phones).
 - Disabled by default until configured.
 
 ### Optional AI Tagging
@@ -336,7 +341,9 @@ on trim mode:
  
  `e` archive 
  
- `l` listen 
+ `l` listen / pause — or listen from the selected paragraph 
+
+ `L` listen from the first paragraph on screen 
  
   `/` search 
 
@@ -381,23 +388,37 @@ next to the compose file — see [`.env.example`](.env.example).
 | `TTS_API_KEY` | unset | API key for narration. Unset = feature off. A free [Fish Audio](https://fish.audio) key works |
 | `TTS_API_URL` | Fish Audio | Text-to-speech endpoint |
 | `TTS_MODEL` | `s2.1-pro-free` | Voice model sent in the `model` header |
-| `TTS_VOICE_ID` | unset | Pin one voice instead of casting per article |
-| `TTS_VOICE_LOCK` | `0` | Set to `1` to use `TTS_VOICE_ID` for everything |
+| `TTS_VOICE_ID` | unset | Voice used when nothing else chooses one (after the library default and the article's own choice) |
+| `TTS_VOICE_LOCK` | `0` | Set to `1` to read everything in `TTS_VOICE_ID`; the voice controls show it and cannot change it |
 | `TTS_VOICE_DENY` | unset | Title substrings, comma separated, to keep out of the catalogue |
 | `TTS_BITRATE` | `64` | mp3 bitrate: 64, 128 or 192 kbps |
-| `TTS_SEGMENT_CHARS` | `1100` | Largest chunk of text sent in one request |
-| `TTS_CONCURRENCY` | `4` | Synthesis requests in flight at once; a segment the player is waiting on goes first |
-| `TTS_WARM_AHEAD` | `3` | Segments synthesised ahead of playback |
-| `TTS_MAX_CACHE_MB` | `512` | Ceiling for cached narration audio |
+| `TTS_SEGMENT_CHARS` | `450` | Longest passage sent in one request; passages aim for 300 characters and never cross a paragraph |
+| `TTS_CONCURRENCY` | `4` | Synthesis requests in flight at once; one slot is always kept for a passage someone is waiting on |
+| `TTS_WARM_AHEAD` | `6` | Most passages synthesised ahead of the listener. How far ahead is measured in seconds of listening (30, up to 90 on a slow connection) |
+| `TTS_REQUEST_TIMEOUT_MS` | `45000` | One provider request, including reading its audio |
+| `TTS_TOTAL_TIMEOUT_MS` | `90000` | All attempts at one passage together (at most 3) |
+| `TTS_MAX_CACHE_MB` | `512` | Ceiling for cached narration audio on the server, passage by passage |
 
 The older `OPENCODE_KEY`, `OPENCODE_API` and `OPENCODE_MODEL` names remain
 accepted as aliases, as do `FISH_AUDIO_API` and `FISH_API_KEY` for `TTS_API_KEY`.
 
-Narration and tagging are independent. Narration works on its own; adding an
-`LLM_API_KEY` on top is what lets it read the article before casting it — the
-voice, the pace, the spoken opening line and the per-article pronunciation list
-all come from that pass. Without it, particle falls back to the article's tags
-and the voice catalogue's own labels.
+Narration and tagging are independent, and narration never calls the LLM.
+
+The voice is chosen in this order: `TTS_VOICE_LOCK`, the article's own choice,
+the library default, the automatic choice already made for that article, then
+`TTS_VOICE_ID`, then a new automatic choice from the voice catalogue, then the
+provider's default. A chosen voice the provider no longer has stops with an
+error and *choose voice*; particle never quietly substitutes another.
+
+#### Narration on phones
+
+Passages are separate small mp3 files with the pause between them recorded as
+silence inside each file, played on two alternating audio elements. Whether a
+locked iPhone or Android phone keeps moving from one file to the next is up to
+the browser, and it has not been verified on devices for this release. If the
+browser stops, the player shows *paused* (or *tap play to continue*) when you
+come back, at the passage where it stopped. For long listening with the screen
+locked, download the article first.
 
 Authentication is off by default for a frictionless localhost install. If the
 port is reachable from the public internet, set `PARTICLE_PASSWORD`; for example:

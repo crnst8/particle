@@ -1,3 +1,41 @@
+## Unreleased — narration
+
+- feat: a default voice for the library, chosen in settings from the whole
+  searchable catalogue (with samples), shared by every device; or Automatic,
+  which picks once per article and keeps it. Any article can have its own voice,
+  and the player says where the voice came from. `TTS_VOICE_LOCK` shows the
+  locked voice and refuses changes
+- feat: listen from here (select text), listen from the visible paragraph, and
+  Listen / Resume / Listen again / Start over in the reader
+- feat: skip a paragraph when reading aloud, or read one particle guessed was
+  furniture; saved with the article, without marking it trimmed
+- feat: download an article for offline listening; it plays with no connection
+- feat: settings → narration; `TTS_REQUEST_TIMEOUT_MS`, `TTS_TOTAL_TIMEOUT_MS`
+- change: captions, credits, bylines, datelines, reading times, tables and code
+  are never read, and there is no spoken intro or outro. The read-captions
+  switch is gone. Passages are one paragraph at most, about 300 characters
+  (`TTS_SEGMENT_CHARS` now caps at 450 by default); `TTS_WARM_AHEAD` is now a
+  ceiling (default 6) on a 30–90 second window
+- change: narration no longer asks the LLM to cast or direct; pacing is fixed
+  by the text
+- change: the bookmark is a passage, not seconds. Old bookmarks convert to the
+  paragraph they pointed at the first time each article is opened
+- fix: a late reply, a slow download or an old play() can no longer restart,
+  pause or seek a newer session; closing while loading stays closed
+- fix: a passage that fails is no longer skipped; Retry, Choose voice and Skip
+  passage are offered. A refused play shows "tap play to continue", never a
+  playing state over silence
+- fix: choosing voice B no longer deletes voice A's audio, and a stale audio URL
+  can no longer return a different voice
+- fix: provider calls have one deadline covering retries and reading the body;
+  401/403/404 are not retried; Retry-After is honoured; work nobody is waiting
+  for is cancelled
+- fix: `bytes=-N` ranges, 416 answers, ETags; the server audio ceiling holds for
+  a single long article
+- fix: silence after a passage updates the mp3's Xing/Info frame count
+- fix: bookmark saves no longer re-index the article for search
+- schema: v4. Back up `particle.db` first; older builds refuse a v4 library
+
 ## 1.3.4 — 2026-09-15
 
 - chore: cleanup

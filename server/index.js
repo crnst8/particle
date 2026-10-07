@@ -10,7 +10,13 @@ import { claimTicket, createTicket, readTicket, settleTicket } from './handoff.j
 import { isLlmConfigured, assessArticle } from './llm.js';
 import { createNarrator } from './narrator.js';
 import { shortlistVoices, toneProfile } from './narration.js';
-import { isTtsConfigured, listVoices, prewarmVoices } from './tts.js';
+import { contentRevision } from './narration-identity.js';
+import {
+  isTtsConfigured, synthesize, synthesisConfig, fetchVoicePages, VOICE_LOCKED, pinnedVoiceId, audioFormat, audioMime,
+} from './tts.js';
+import { createVoiceCatalogue } from './voice-catalogue.js';
+import { parseRange } from './http-range.js';
+import { validBookmark } from '../public/narration-model.js';
 import { safeFetch } from './net.js';
 import { log, readScreenshot, screenshotMaxBytes, screenshotReadingEnabled } from './screenshot.js';
 import { isCertain, resolveCandidates } from './resolve.js';
@@ -34,7 +40,25 @@ const shellTemplate = readFileSync(join(pub, 'index.html'), 'utf8');
 const manifestTemplate = JSON.parse(readFileSync(join(pub, 'manifest.webmanifest'), 'utf8'));
 const store = DEMO_MODE ? null : await import('./db.js');
 // Narration needs somewhere to keep the audio, so it follows the library server.
-const narrator = store && isTtsConfigured ? createNarrator(store) : null;
+const catalogue = store && isTtsConfigured ? createVoiceCatalogue({
+  fetchPages: language => fetchVoicePages(language),
+  load: language => store.loadCatalogue(language),
+  save: (language, voices, fetchedAt) => store.saveCatalogue(language, voices, fetchedAt),
+  log: message => console.error(`tts: ${message}`),
+}) : null;
+const narrator = catalogue ? createNarrator(store, {
+  synthesize,
+  synthesisConfig,
+  catalogue,
+  audioFormat,
+  audioMime,
+  lockedVoiceId: VOICE_LOCKED ? pinnedVoiceId : null,
+  envVoiceId: VOICE_LOCKED ? null : pinnedVoiceId,
+  concurrency: positiveInt(process.env.TTS_CONCURRENCY, 4),
+  maxCacheBytes: positiveInt(process.env.TTS_MAX_CACHE_MB, 512) * 1024 * 1024,
+  warmAhead: Math.min(12, positiveInt(process.env.TTS_WARM_AHEAD, 6)),
+  log: message => console.error(message),
+}) : null;
 
 const app = express();
 app.disable('x-powered-by');
@@ -308,9 +332,9 @@ if (DEMO_MODE) {
 app.listen(PORT, () => {
   const mode = DEMO_MODE ? `demo at ${BASE || '/'}` : 'library';
   console.log(`particle ${mode} listening on :${PORT}`);
-  // The catalogue is a network round trip the first article would otherwise
-  // wait on, and it changes about as often as the provider ships voices.
-  if (narrator) prewarmVoices().catch(() => {});
+  // Listening never waits on the catalogue, but the picker does the first time;
+  // fetch it now (or refresh the saved copy) so it rarely has to.
+  if (catalogue) catalogue.get('en', { wait: 0 }).catch(() => {});
 });
 
 function registerLibraryRoutes(router) {
@@ -321,7 +345,7 @@ function registerLibraryRoutes(router) {
   router.get(api('/articles/:id'), (req, res) => {
     const article = store.getArticle(Number(req.params.id));
     if (!article) return res.status(404).json({ error: 'not found' });
-    res.json(article);
+    res.json(withNarrationState(article));
   });
 
   router.post(api('/articles'), async (req, res) => {
@@ -343,7 +367,8 @@ function registerLibraryRoutes(router) {
       const filed = extracted.url === url ? existing : store.getByUrl(extracted.url);
       if (filed) {
         const updated = store.replaceArticleContent(filed.id, extracted);
-        res.json(withChallenge(updated, extracted));
+        narrator?.invalidate(filed.id);
+        res.json(withChallenge(withNarrationState(updated), extracted));
         return filed.id;
       }
       const saved = store.insertArticle(extracted);
@@ -370,7 +395,8 @@ function registerLibraryRoutes(router) {
     try {
       const extracted = await extractArticle(article.url, pageSource(req.body));
       const updated = store.replaceArticleContent(article.id, extracted);
-      res.json(withChallenge(updated, extracted));
+      narrator?.invalidate(article.id);
+      res.json(withChallenge(withNarrationState(updated), extracted));
       if (isLlmConfigured) enrichInBackground(article.id);
     } catch (error) {
       extractionError(res, error);
@@ -411,19 +437,29 @@ function registerLibraryRoutes(router) {
       fields.text_content = text;
       fields.word_count = wordCount;
       fields.excerpt = text.slice(0, 300);
-      fields.edited_at = new Date().toISOString();
+      // marking a paragraph "skip when reading aloud" changes what is spoken,
+      // not what is saved; it is not a trim and does not say "trimmed"
+      const previous = store.getArticle(id).content_html || '';
+      if (withoutSpeechMarks(clean) !== withoutSpeechMarks(sanitizeArticleHtml(previous))) {
+        fields.edited_at = new Date().toISOString();
+      }
     }
-    res.json(store.updateArticle(id, fields));
+    const updated = store.updateArticle(id, fields);
+    if ('content_html' in fields) narrator?.invalidate(id);
+    res.json(withNarrationState(updated));
   });
 
   router.delete(api('/articles/:id'), (req, res) => {
-    store.deleteArticle(Number(req.params.id));
+    const id = Number(req.params.id);
+    narrator?.forget(id);
+    store.deleteArticle(id);
     res.json({ ok: true });
   });
 
   // Settings → reset. Destructive and unrecoverable, so it is its own route
   // rather than a flag on anything else.
   router.delete(api('/articles'), (req, res) => {
+    narrator?.invalidateAll();
     res.json(store.deleteAllArticles({ includeCollections: req.query.lists === '1' }));
   });
 
@@ -465,65 +501,165 @@ function registerLibraryRoutes(router) {
 }
 
 /* ── narration ───────────────────────────────────────────────────────────────
-   The script and the casting come back as one manifest; the audio for each
-   segment is a separate URL the player pulls as it goes, which is what keeps a
-   long article from being synthesised in full before a word is heard. */
+   Preparing returns a manifest — the script, the voice, where to start — and
+   each passage's audio is its own URL under the variant's revision, pulled as
+   the player reaches it. A revision names exact bytes: no URL ever serves a
+   different voice or script than the one it names. */
 function registerNarrationRoutes(router) {
   const findArticle = (req, res) => {
     const article = store.getArticle(Number(req.params.id));
-    if (!article) res.status(404).json({ error: 'not found' });
+    if (!article) res.status(404).json({ error: 'not found', code: 'not_found' });
     return article;
   };
+  const fail = (res, error) => {
+    const status = error?.statusCode || (error?.code === 'cancelled' ? 409 : 502);
+    const { statusCode: _s, message, code, retryable, stack: _stack, name: _name, ...extra } = error || {};
+    res.status(status).json({
+      error: message || 'narration failed',
+      code: code || 'failed',
+      retryable: Boolean(retryable ?? status >= 500),
+      ...pick(extra, ['voice_version', 'voice', 'blocks', 'bookmark', 'version', 'settings', 'retryAfterMs']),
+    });
+  };
 
-  /* `for` is an article id: the same ranking that cast it, so the picker offers
-     the voices that suit this piece rather than whichever the provider lists
-     first. Without it the catalogue comes back in the provider's own order. */
-  router.get(api('/narration/voices'), async (req, res) => {
-    try {
-      const voices = await listVoices(String(req.query.lang || 'en'));
-      const article = req.query.for ? store.getArticle(Number(req.query.for)) : null;
-      const profile = article ? toneProfile(article) : null;
-      const ranked = article ? shortlistVoices(article, voices, profile) : voices;
-      res.json(ranked.map(({ id, title, description, tags, sample }, index) => ({
-        id, title, description, tags, sample,
-        suits: Boolean(article) && index < 6,
-      })));
-    } catch (error) {
-      res.status(502).json({ error: error.message });
-    }
-  });
-
-  router.get(api('/articles/:id/narration'), async (req, res) => {
-    const article = findArticle(req, res);
-    if (!article) return;
-    const existing = store.getNarration(article.id);
-    if (!existing) return res.status(404).json({ error: 'not narrated yet' });
+  // ── settings ──
+  router.get(api('/narration/settings'), (_req, res) => {
+    const settings = store.getNarrationSettings();
     res.set('Cache-Control', 'no-store');
-    res.json(narrator.manifest(article, existing));
+    res.json({
+      enabled: true,
+      default_voice_id: settings.default_voice_id,
+      default_voice_name: settings.default_voice_name,
+      version: settings.version,
+      locked: VOICE_LOCKED,
+      locked_voice: VOICE_LOCKED ? { id: pinnedVoiceId, name: catalogue.known(pinnedVoiceId)?.title || 'locked voice' } : null,
+      configured_voice: !VOICE_LOCKED && pinnedVoiceId ? { id: pinnedVoiceId, name: catalogue.known(pinnedVoiceId)?.title || 'configured voice' } : null,
+    });
   });
 
-  router.post(api('/articles/:id/narration'), async (req, res) => {
-    const article = findArticle(req, res);
-    if (!article) return;
-    if (!article.text_content) return res.status(422).json({ error: 'nothing to read aloud' });
+  router.patch(api('/narration/settings'), (req, res) => {
+    const body = req.body || {};
+    const voice = voiceInput(body.default_voice_id, body.default_voice_name);
+    if (voice === undefined) return res.status(400).json({ error: 'default_voice_id must be a voice id or null', code: 'bad_request' });
+    if (!Number.isSafeInteger(body.expected_version)) return res.status(400).json({ error: 'expected_version is required', code: 'bad_request' });
+    if (VOICE_LOCKED) return res.status(409).json({ error: 'this install reads every article in one voice', code: 'voice_locked' });
+    const result = store.updateNarrationSettings({
+      default_voice_id: voice?.id ?? null,
+      default_voice_name: voice?.name ?? null,
+      expected_version: body.expected_version,
+    });
+    res.set('Cache-Control', 'no-store');
+    if (!result.ok) return res.status(409).json({ error: 'the default voice was changed elsewhere', code: 'settings_conflict', settings: result.settings });
+    res.json(result.settings);
+  });
+
+  /* The catalogue as the picker shows it. `for` is an article id: the same
+     ranking an automatic choice would use, so the voices that suit this piece
+     come first. The library's saved choices are always listed, catalogue or no
+     catalogue, so a choice can be seen and kept while the provider is away. */
+  router.get(api('/narration/voices'), async (req, res) => {
+    const language = /^[a-z]{2,3}$/.test(String(req.query.lang || '')) ? String(req.query.lang) : 'en';
+    const listing = await catalogue.get(language);
+    const article = req.query.for ? store.getArticle(Number(req.query.for)) : null;
+    const ranked = article ? shortlistVoices(article, listing.voices, toneProfile(article)) : listing.voices;
+    const voices = ranked.map(({ id, title, description, tags, sample }, index) => ({
+      id, title, description, tags: (tags || []).slice(0, 8), sample, suits: Boolean(article) && index < 6,
+    }));
+    const settings = store.getNarrationSettings();
+    const saved = [];
+    const keep = (id, name, role) => {
+      if (!id || saved.some(one => one.id === id)) return;
+      const known = voices.find(one => one.id === id);
+      saved.push({ id, title: known?.title || name || 'chosen voice', role, listed: Boolean(known), sample: known?.sample || null });
+    };
+    keep(settings.default_voice_id, settings.default_voice_name, 'default');
+    if (article?.narration_voice_id) keep(article.narration_voice_id, article.narration_voice_name, 'article');
+    if (VOICE_LOCKED) keep(pinnedVoiceId, 'locked voice', 'locked');
+    res.set('Cache-Control', 'no-store');
+    res.json({ voices, saved, stale: listing.stale, refreshing: listing.refreshing, error_code: listing.error_code, fetched_at: listing.fetched_at });
+  });
+
+  router.get(api('/narration/diagnostics'), (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json(narrator.diagnostics());
+  });
+
+  // ── one article ──
+  // Registered before "/:seq": none of these words is a passage number.
+  router.get(api('/articles/:id/narration/blocks'), (req, res) => {
     try {
-      const narration = await narrator.ensure(article, {
-        force: Boolean(req.body?.force),
-        voiceId: typeof req.body?.voice_id === 'string' ? req.body.voice_id.trim() : null,
-      });
-      const manifest = narrator.manifest(article, narration);
       res.set('Cache-Control', 'no-store');
-      res.json(manifest);
-      narrator.warm(article, narration, Math.max(0, Number(req.body?.from) || 0));
+      res.json(narrator.blocks(Number(req.params.id)));
     } catch (error) {
-      res.status(502).json({ error: error.message });
+      fail(res, error);
     }
   });
 
-  /* What the narration is doing right now, as it does it. Casting and synthesis
-     take real seconds and a reader deserves to know which one they are in, so
-     the stages are streamed rather than guessed at by the client. Registered
-     ahead of the segment route: "status" is not a segment number. */
+  router.get(api('/articles/:id/narration'), (req, res) => {
+    try {
+      res.set('Cache-Control', 'no-store');
+      res.json(narrator.current(Number(req.params.id), typeof req.query.rev === 'string' ? req.query.rev : null));
+    } catch (error) {
+      fail(res, error);
+    }
+  });
+
+  router.post(api('/articles/:id/narration'), (req, res) => {
+    const body = req.body || {};
+    const prepare = {
+      request_id: shortString(body.request_id, 64),
+      session_id: shortString(body.session_id, 64),
+      generation: Number.isSafeInteger(body.generation) ? body.generation : 0,
+      start: startInput(body.start),
+    };
+    if (prepare.start === undefined) return res.status(400).json({ error: 'start is not one of resume, beginning or block', code: 'bad_request' });
+    if ('voice_override' in body) {
+      const voice = body.voice_override === null ? null : voiceInput(body.voice_override?.id, body.voice_override?.name);
+      if (voice === undefined) return res.status(400).json({ error: 'voice_override must be {id, name} or null', code: 'bad_request' });
+      if (!Number.isSafeInteger(body.expected_voice_version)) {
+        return res.status(400).json({ error: 'expected_voice_version is required to change the voice', code: 'bad_request' });
+      }
+      prepare.voice_override = voice;
+      prepare.expected_voice_version = body.expected_voice_version;
+    }
+    try {
+      res.set('Cache-Control', 'no-store');
+      res.json(narrator.prepare(Number(req.params.id), prepare));
+    } catch (error) {
+      fail(res, error);
+    }
+  });
+
+  router.put(api('/articles/:id/narration/position'), (req, res) => {
+    const article = findArticle(req, res);
+    if (!article) return;
+    const body = req.body || {};
+    const bookmark = body.bookmark === null ? null : validBookmark(body.bookmark);
+    if (body.bookmark !== null && !bookmark) return res.status(400).json({ error: 'that is not a bookmark', code: 'bad_request' });
+    if (!Number.isSafeInteger(body.expected_version)) return res.status(400).json({ error: 'expected_version is required', code: 'bad_request' });
+    if (bookmark && !knownPlace(article.id, bookmark)) {
+      return res.status(422).json({ error: 'that bookmark names a passage this article does not have', code: 'unknown_place' });
+    }
+    const result = store.updateBookmark(article.id, bookmark, body.expected_version);
+    res.set('Cache-Control', 'no-store');
+    if (!result.ok) {
+      return res.status(409).json({ error: 'the bookmark was moved on another device', code: 'bookmark_conflict', bookmark: result.bookmark, version: result.version });
+    }
+    res.json({ bookmark: result.bookmark, version: result.version });
+  });
+
+  router.post(api('/articles/:id/narration/demand'), (req, res) => {
+    try {
+      res.set('Cache-Control', 'no-store');
+      res.json(narrator.demand(Number(req.params.id), req.body || {}));
+    } catch (error) {
+      fail(res, error);
+    }
+  });
+
+  /* What the narration is doing right now, as it does it. Each event names the
+     revision, passage and request it belongs to, so a player can ignore what is
+     not its own; the player works without this stream entirely. */
   router.get(api('/articles/:id/narration/status'), (req, res) => {
     const article = findArticle(req, res);
     if (!article) return;
@@ -544,22 +680,30 @@ function registerNarrationRoutes(router) {
     req.on('close', () => { clearInterval(beat); stop(); });
   });
 
+  /* One passage of one exact variant. The revision is required: answering a
+     bare number with whatever the article currently sounds like is how a stale
+     page used to get a paragraph in a voice the reader had already replaced. */
   router.get(api('/articles/:id/narration/:seq'), async (req, res) => {
-    const article = findArticle(req, res);
-    if (!article) return;
-    const narration = store.getNarration(article.id);
-    if (!narration) return res.status(404).json({ error: 'not narrated yet' });
-
+    const id = Number(req.params.id);
     const seq = Number(req.params.seq);
-    if (!Number.isInteger(seq) || seq < 0) return res.status(400).json({ error: 'bad segment' });
+    if (!Number.isInteger(seq) || seq < 0) return res.status(400).json({ error: 'bad segment', code: 'bad_request' });
+    const rev = typeof req.query.v === 'string' ? req.query.v : '';
+    if (!rev) return res.status(409).json({ error: 'a narration revision is required', code: 'revision_required' });
 
+    const controller = new AbortController();
+    // `close` on the response, not the request: the request side closes as soon
+    // as its (empty) body has been read
+    res.on('close', () => { if (!res.writableFinished) controller.abort(); });
     try {
-      const { audio, duration } = await narrator.segment(article, narration, seq);
-      store.touchNarration(article.id);
-      sendAudio(req, res, audio, { duration, rev: narrator.rev(narration), asked: String(req.query.v || '') });
-      narrator.warm(article, narration, seq + 1);
+      const { audio, duration } = await narrator.segment(id, rev, seq, {
+        signal: controller.signal,
+        priority: req.query.priority === 'background' ? 'background' : 'foreground',
+      });
+      if (controller.signal.aborted) return;
+      sendAudio(req, res, audio, { duration, etag: `"${rev}-${seq}-${audio.length}"` });
     } catch (error) {
-      res.status(error.statusCode || 502).json({ error: error.message });
+      if (controller.signal.aborted || res.headersSent) return;
+      fail(res, error);
     }
   });
 
@@ -569,30 +713,99 @@ function registerNarrationRoutes(router) {
     narrator.drop(article.id);
     res.json({ ok: true });
   });
+
+  /* A bookmark is accepted only for a passage that exists: in a kept variant,
+     or in the script the article has right now. */
+  function knownPlace(articleId, bookmark) {
+    if (bookmark.rev === 'legacy') return true;
+    const variant = store.getVariant(articleId, bookmark.rev) || store.getVariantByScript(articleId, bookmark.script_id);
+    if (!variant) return false;
+    const segment = variant.script.segments.find(one => one.id === bookmark.segment_id);
+    return Boolean(segment) && segment.block_id === bookmark.block_id;
+  }
 }
 
-// Segments are small and complete, but Safari will not start playback without a
-// range answer, so give it one.
-function sendAudio(req, res, audio, { duration, rev, asked }) {
+/* A voice from the request: an id and a label, both bounded, no control
+   characters. null means "none" (Automatic, or back to the default);
+   undefined means the input was not one of those. */
+function voiceInput(id, name) {
+  if (id === null) return null;
+  if (typeof id !== 'string') return undefined;
+  const clean = id.trim();
+  if (!clean || clean.length > 256 || /[\u0000-\u001f\u007f]/.test(clean)) return undefined;
+  const label = typeof name === 'string' ? name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 256) : '';
+  return { id: clean, name: label || null };
+}
+
+function startInput(start) {
+  if (start === undefined || start === null) return { mode: 'resume' };
+  if (typeof start !== 'object') return undefined;
+  if (start.mode === 'beginning') return { mode: 'beginning' };
+  if (start.mode === 'resume' || start.mode === undefined) {
+    return { mode: 'resume', ...(start.bookmark ? { bookmark: validBookmark(start.bookmark) } : {}) };
+  }
+  if (start.mode === 'block' && typeof start.block_id === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(start.block_id)) {
+    const revision = shortString(start.content_revision, 64);
+    return { mode: 'block', block_id: start.block_id, ...(revision ? { content_revision: revision } : {}) };
+  }
+  return undefined;
+}
+
+const shortString = (value, max) => (typeof value === 'string' && value.length <= max ? value : undefined);
+const pick = (object, keys) => Object.fromEntries(keys.filter(key => object[key] !== undefined).map(key => [key, object[key]]));
+
+/* What the reader needs alongside an article to offer Listen, Resume or Listen
+   again without asking anything else: its content revision and its bookmark. */
+function withNarrationState(article) {
+  if (!article) return article;
+  return {
+    ...article,
+    content_revision: contentRevision(article),
+    audio_bookmark: safeParse(article.audio_bookmark),
+  };
+}
+
+function safeParse(value) {
+  if (!value || typeof value !== 'string') return value && typeof value === 'object' ? value : null;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+/* A body with the reader's speech marks taken out, to tell a trim from a mark.
+   Whitespace between tags is layout, not content, and the browser's copy of
+   the body does not keep it the way the stored one does. */
+function withoutSpeechMarks(html) {
+  return String(html || '')
+    .replace(/\s+data-particle-speech="(?:exclude|include)"/g, '')
+    .replace(/>\s+</g, '><')
+    .trim();
+}
+
+/* Passages are small and complete, and each URL names exact bytes, so a full
+   answer is cached hard. Ranges are answered properly — Safari will not start
+   playback without one, and media elements seek with them. */
+function sendAudio(req, res, audio, { duration, etag }) {
   res.set('Content-Type', 'audio/mpeg');
-  // The URL carries the casting's revision, so an answer that matches keeps for
-  // a week. Anything else is the article's *current* audio under a stale name —
-  // recasting reuses the segment numbers — and must not be remembered.
-  res.set('Cache-Control', rev && asked === rev ? 'private, max-age=604800, immutable' : 'no-store');
+  res.set('Cache-Control', 'private, max-age=31536000, immutable');
+  res.set('ETag', etag);
   res.set('X-Narration-Duration', String(duration));
   res.set('Accept-Ranges', 'bytes');
 
-  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
-  if (!range) return res.status(200).send(audio);
-
-  const start = range[1] ? Number(range[1]) : 0;
-  const end = range[2] ? Math.min(Number(range[2]), audio.length - 1) : audio.length - 1;
-  if (!(start <= end && start < audio.length)) {
+  // If-Range with a different validator means "the whole thing", not the slice
+  const ifRange = req.headers['if-range'];
+  const range = ifRange && ifRange !== etag ? { type: 'none' } : parseRange(req.headers.range, audio.length);
+  if (range.type === 'unsatisfiable') {
     return res.status(416).set('Content-Range', `bytes */${audio.length}`).end();
   }
+  if (range.type !== 'range') {
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+    res.set('Content-Length', String(audio.length));
+    return res.status(200).end(audio);
+  }
+  const slice = audio.subarray(range.start, range.end + 1);
   res.status(206)
-    .set('Content-Range', `bytes ${start}-${end}/${audio.length}`)
-    .send(audio.subarray(start, end + 1));
+    .set('Content-Range', `bytes ${range.start}-${range.end}/${audio.length}`)
+    .set('Content-Length', String(slice.length))
+    .end(slice);
 }
 
 function normalizeBase(value) {
@@ -676,6 +889,7 @@ function saveExtracted(extracted) {
   const existing = store.getByUrl(extracted.url);
   if (existing) {
     const updated = store.replaceArticleContent(existing.id, extracted);
+    narrator?.invalidate(existing.id);
     if (isLlmConfigured) enrichInBackground(existing.id);
     return updated;
   }

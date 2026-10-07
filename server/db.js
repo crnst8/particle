@@ -13,7 +13,8 @@ db.exec(`
 `);
 
 const { user_version: version } = db.prepare('PRAGMA user_version').get();
-if (version > 3) throw new Error(`Database schema ${version} is newer than this particle build supports`);
+export const SCHEMA_VERSION = 4;
+if (version > SCHEMA_VERSION) throw new Error(`Database schema ${version} is newer than this particle build supports`);
 
 if (version < 1) db.exec(`
   BEGIN IMMEDIATE;
@@ -128,6 +129,89 @@ if (version < 3) db.exec(`
   CREATE INDEX IF NOT EXISTS idx_article_collections_c ON article_collections(collection_id);
 
   PRAGMA user_version = 3;
+  COMMIT;
+`);
+
+/* v4 — narration you choose and can come back to.
+
+   A voice is chosen once for the library (or per article) instead of cast per
+   play, so the choice is stored. Narrations become immutable variants keyed by
+   a revision that names their content, script and voice: choosing B never
+   deletes A's audio, and coming back to A plays what is already cached. The
+   bookmark names a passage, not seconds on a clock that moves.
+
+   The old narration tables and audio_pos stay for now: each article's old
+   bookmark is converted through its own script the first time it is opened,
+   then the old rows go. The search index stops being rewritten on every
+   bookmark save — it only follows the columns it indexes. */
+if (version < 4) db.exec(`
+  BEGIN IMMEDIATE;
+
+  CREATE TABLE IF NOT EXISTS narration_settings (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    default_voice_id   TEXT,
+    default_voice_name TEXT,
+    version            INTEGER NOT NULL DEFAULT 0
+  );
+  INSERT OR IGNORE INTO narration_settings (id) VALUES (1);
+
+  ALTER TABLE articles ADD COLUMN narration_voice_id TEXT;
+  ALTER TABLE articles ADD COLUMN narration_voice_name TEXT;
+  ALTER TABLE articles ADD COLUMN narration_voice_version INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE articles ADD COLUMN audio_bookmark TEXT;
+  ALTER TABLE articles ADD COLUMN audio_bookmark_version INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE IF NOT EXISTS narration_variants (
+    article_id       INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    rev              TEXT NOT NULL,
+    script_id        TEXT NOT NULL,
+    content_revision TEXT NOT NULL,
+    voice_id         TEXT,
+    voice_name       TEXT,
+    language         TEXT,
+    config           TEXT NOT NULL DEFAULT '{}',
+    script           TEXT NOT NULL,
+    created_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    last_used_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (article_id, rev)
+  );
+
+  CREATE TABLE IF NOT EXISTS narration_audio (
+    article_id   INTEGER NOT NULL,
+    rev          TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    audio        BLOB NOT NULL,
+    bytes        INTEGER NOT NULL,
+    duration     REAL NOT NULL,
+    last_used_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (article_id, rev, seq),
+    FOREIGN KEY (article_id, rev) REFERENCES narration_variants(article_id, rev) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_narration_audio_used ON narration_audio(last_used_at);
+
+  CREATE TABLE IF NOT EXISTS narration_voice_catalogue (
+    language   TEXT PRIMARY KEY,
+    fetched_at TEXT NOT NULL,
+    payload    TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS narration_auto_choices (
+    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    script_id  TEXT NOT NULL,
+    voice_id   TEXT,
+    voice_name TEXT,
+    PRIMARY KEY (article_id, script_id)
+  );
+
+  DROP TRIGGER IF EXISTS articles_au;
+  CREATE TRIGGER articles_au AFTER UPDATE OF title, byline, site_name, text_content, tags ON articles BEGIN
+    INSERT INTO articles_fts(articles_fts, rowid, title, byline, site_name, text_content, tags)
+    VALUES ('delete', old.id, old.title, old.byline, old.site_name, old.text_content, old.tags);
+    INSERT INTO articles_fts(rowid, title, byline, site_name, text_content, tags)
+    VALUES (new.id, new.title, new.byline, new.site_name, new.text_content, new.tags);
+  END;
+
+  PRAGMA user_version = 4;
   COMMIT;
 `);
 
@@ -319,103 +403,310 @@ function safeJson(s, fallback) {
 }
 
 // ── narration ────────────────────────────────────────────────────────────────
-// A narration is one spoken rendering of one version of an article: the script,
-// the casting decisions behind it, and the audio for each segment as it is
-// synthesised. Rebuilding is cheap for the script and expensive for the audio,
-// so the audio is what the cache is really for.
+// A narration variant is one spoken rendering of one version of an article in
+// one voice: an immutable script plus the audio of each passage as it is
+// synthesised. Variants are never rewritten, only added and, past a small
+// number per article, forgotten; the audio is the expensive part and is evicted
+// passage by passage under a byte ceiling.
 
-export function getNarration(articleId) {
+const now = () => new Date().toISOString();
+
+function transaction(run) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = run();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+// ── settings and the reader's choices ──
+
+export function getNarrationSettings() {
+  const row = db.prepare('SELECT default_voice_id, default_voice_name, version FROM narration_settings WHERE id = 1').get();
+  return row || { default_voice_id: null, default_voice_name: null, version: 0 };
+}
+
+/** Compare-and-set: a stale version changes nothing and says so. */
+export function updateNarrationSettings({ default_voice_id, default_voice_name, expected_version }) {
+  const result = db.prepare(`UPDATE narration_settings
+    SET default_voice_id = ?, default_voice_name = ?, version = version + 1
+    WHERE id = 1 AND version = ?`).run(default_voice_id ?? null, default_voice_name ?? null, expected_version);
+  return { ok: result.changes === 1, settings: getNarrationSettings() };
+}
+
+export function getVoiceOverride(articleId) {
+  const row = db.prepare(`SELECT narration_voice_id AS id, narration_voice_name AS name,
+    narration_voice_version AS version FROM articles WHERE id = ?`).get(articleId);
+  return row ? { voice: row.id ? { id: row.id, name: row.name } : null, version: row.version } : null;
+}
+
+/** null clears the override; the article goes back to the library default. */
+export function setVoiceOverride(articleId, voice, expectedVersion) {
+  const result = db.prepare(`UPDATE articles
+    SET narration_voice_id = ?, narration_voice_name = ?, narration_voice_version = narration_voice_version + 1
+    WHERE id = ? AND narration_voice_version = ?`).run(voice?.id ?? null, voice?.id ? voice.name ?? null : null,
+    articleId, expectedVersion);
+  return { ok: result.changes === 1, ...getVoiceOverride(articleId) };
+}
+
+// ── bookmarks ──
+
+export function getBookmark(articleId) {
+  const row = db.prepare('SELECT audio_bookmark, audio_bookmark_version FROM articles WHERE id = ?').get(articleId);
+  if (!row) return null;
+  return { bookmark: safeJson(row.audio_bookmark, null), version: row.audio_bookmark_version };
+}
+
+export function updateBookmark(articleId, bookmark, expectedVersion) {
+  const result = db.prepare(`UPDATE articles
+    SET audio_bookmark = ?, audio_bookmark_version = audio_bookmark_version + 1
+    WHERE id = ? AND audio_bookmark_version = ?`).run(bookmark ? JSON.stringify(bookmark) : null, articleId, expectedVersion);
+  return { ok: result.changes === 1, ...getBookmark(articleId) };
+}
+
+// ── variants ──
+
+function hydrateVariant(row) {
+  if (!row) return null;
+  return { ...row, config: safeJson(row.config, {}), script: safeJson(row.script, { segments: [], blocks: [] }) };
+}
+
+export function getVariant(articleId, rev) {
+  return hydrateVariant(db.prepare('SELECT * FROM narration_variants WHERE article_id = ? AND rev = ?').get(articleId, rev));
+}
+
+/** Any variant of one script — every voice of it shares the same blocks. */
+export function getVariantByScript(articleId, scriptId) {
+  return hydrateVariant(db.prepare(`SELECT * FROM narration_variants WHERE article_id = ? AND script_id = ?
+    ORDER BY last_used_at DESC LIMIT 1`).get(articleId, scriptId));
+}
+
+export function listVariants(articleId) {
+  return db.prepare(`SELECT rev, script_id, content_revision, voice_id, voice_name, created_at, last_used_at
+    FROM narration_variants WHERE article_id = ? ORDER BY last_used_at DESC`).all(articleId);
+}
+
+/**
+ * File a variant, or find the identical one already filed. The article is read
+ * again inside the same transaction: a variant for text that was edited or
+ * deleted while it was being prepared is refused rather than saved.
+ */
+export function saveVariant(articleId, variant, { contentRevisionOf }) {
+  return transaction(() => {
+    const article = db.prepare('SELECT * FROM articles WHERE id = ?').get(articleId);
+    if (!article) throw Object.assign(new Error('that article is gone'), { statusCode: 404, code: 'not_found' });
+    if (contentRevisionOf(hydrate(article)) !== variant.content_revision) {
+      throw Object.assign(new Error('the article changed while its narration was being prepared'),
+        { statusCode: 409, code: 'content_changed' });
+    }
+    db.prepare(`INSERT OR IGNORE INTO narration_variants
+      (article_id, rev, script_id, content_revision, voice_id, voice_name, language, config, script)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(articleId, variant.rev, variant.script_id, variant.content_revision,
+      variant.voice_id ?? null, variant.voice_name ?? null, variant.language ?? null,
+      JSON.stringify(variant.config || {}), JSON.stringify(variant.script));
+    db.prepare('UPDATE narration_variants SET last_used_at = ? WHERE article_id = ? AND rev = ?').run(now(), articleId, variant.rev);
+    return getVariant(articleId, variant.rev);
+  });
+}
+
+export function touchVariant(articleId, rev) {
+  db.prepare('UPDATE narration_variants SET last_used_at = ? WHERE article_id = ? AND rev = ?').run(now(), articleId, rev);
+}
+
+/* Past `keep` variants an article forgets the least recently used, audio and
+   all. Variants still being listened to, and the one the bookmark was made on
+   (it is how a changed article maps the bookmark forward), are kept. */
+export function pruneVariants(articleId, { keep = 3, protect = [] } = {}) {
+  const keepRevs = new Set(protect.filter(Boolean));
+  const bookmark = getBookmark(articleId)?.bookmark;
+  const variants = listVariants(articleId);
+  if (bookmark?.rev) keepRevs.add(bookmark.rev);
+  if (bookmark?.script_id && !variants.some(v => keepRevs.has(v.rev) && v.script_id === bookmark.script_id)) {
+    const forScript = variants.find(v => v.script_id === bookmark.script_id);
+    if (forScript) keepRevs.add(forScript.rev);
+  }
+  let kept = 0;
+  const gone = [];
+  for (const variant of variants) {
+    if (keepRevs.has(variant.rev) || kept < keep) { kept += 1; continue; }
+    gone.push(variant.rev);
+  }
+  if (!gone.length) return [];
+  transaction(() => {
+    for (const rev of gone) db.prepare('DELETE FROM narration_variants WHERE article_id = ? AND rev = ?').run(articleId, rev);
+    // an automatic choice belongs to a script; once no variant of it is left, neither is the choice
+    db.prepare(`DELETE FROM narration_auto_choices WHERE article_id = ?
+      AND script_id NOT IN (SELECT script_id FROM narration_variants WHERE article_id = ?)`).run(articleId, articleId);
+  });
+  return gone;
+}
+
+// ── audio ──
+
+export function getAudio(articleId, rev, seq) {
+  const row = db.prepare('SELECT audio, bytes, duration FROM narration_audio WHERE article_id = ? AND rev = ? AND seq = ?')
+    .get(articleId, rev, seq);
+  if (!row) return null;
+  db.prepare('UPDATE narration_audio SET last_used_at = ? WHERE article_id = ? AND rev = ? AND seq = ?')
+    .run(now(), articleId, rev, seq);
+  return row;
+}
+
+export function hasAudio(articleId, rev, seq) {
+  return Boolean(db.prepare('SELECT 1 FROM narration_audio WHERE article_id = ? AND rev = ? AND seq = ?').get(articleId, rev, seq));
+}
+
+/** Which passages of a variant are synthesised, and how long each runs. */
+export function audioIndex(articleId, rev) {
+  return db.prepare('SELECT seq, bytes, duration FROM narration_audio WHERE article_id = ? AND rev = ? ORDER BY seq')
+    .all(articleId, rev);
+}
+
+export function narrationCacheBytes() {
+  const current = db.prepare('SELECT COALESCE(SUM(bytes), 0) AS total FROM narration_audio').get().total;
+  const legacy = db.prepare('SELECT COALESCE(SUM(bytes), 0) AS total FROM narration_segments').get().total;
+  return current + legacy;
+}
+
+/**
+ * Store one passage under the byte ceiling. Room is made by evicting the least
+ * recently used passages — old-format audio included — except those `protect`
+ * names (what someone is about to hear). If it still cannot fit, nothing is
+ * stored and the caller serves the bytes it has: the ceiling holds.
+ */
+export function saveAudio(articleId, rev, seq, audio, duration, { maxBytes = Infinity, protect = new Set() } = {}) {
+  return transaction(() => {
+    if (!db.prepare('SELECT 1 FROM narration_variants WHERE article_id = ? AND rev = ?').get(articleId, rev)) {
+      return { stored: false, reason: 'variant_gone' };
+    }
+    const existing = db.prepare('SELECT bytes FROM narration_audio WHERE article_id = ? AND rev = ? AND seq = ?')
+      .get(articleId, rev, seq);
+    let total = narrationCacheBytes() - (existing?.bytes || 0);
+    if (audio.length > maxBytes) return { stored: false, reason: 'too_large' };
+    if (total + audio.length > maxBytes) {
+      const candidates = db.prepare(`
+        SELECT 'audio' AS kind, article_id, rev, seq, bytes, last_used_at AS used FROM narration_audio
+        UNION ALL
+        SELECT 'legacy' AS kind, s.article_id, NULL AS rev, s.seq, s.bytes,
+               COALESCE(n.played_at, n.created_at, s.created_at, '') AS used
+        FROM narration_segments s LEFT JOIN narrations n ON n.article_id = s.article_id
+        ORDER BY used ASC`).all();
+      const victims = [];
+      let freeable = 0;
+      for (const row of candidates) {
+        if (total - freeable + audio.length <= maxBytes) break;
+        if (row.kind === 'audio' && (protect.has(`${row.article_id}:${row.rev}:${row.seq}`)
+          || (row.article_id === articleId && row.rev === rev && row.seq === seq))) continue;
+        victims.push(row);
+        freeable += row.bytes;
+      }
+      if (total - freeable + audio.length > maxBytes) return { stored: false, reason: 'cache_full' };
+      for (const row of victims) {
+        if (row.kind === 'audio') {
+          db.prepare('DELETE FROM narration_audio WHERE article_id = ? AND rev = ? AND seq = ?').run(row.article_id, row.rev, row.seq);
+        } else {
+          db.prepare('DELETE FROM narration_segments WHERE article_id = ? AND seq = ?').run(row.article_id, row.seq);
+        }
+      }
+      total -= freeable;
+    }
+    db.prepare(`INSERT INTO narration_audio (article_id, rev, seq, audio, bytes, duration, last_used_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(article_id, rev, seq) DO UPDATE SET audio = excluded.audio, bytes = excluded.bytes,
+        duration = excluded.duration, last_used_at = excluded.last_used_at`)
+      .run(articleId, rev, seq, audio, audio.length, duration, now());
+    return { stored: true, total: total + audio.length };
+  });
+}
+
+// ── automatic choices ──
+
+/* An automatic voice is chosen once per script and then kept, so the same
+   article does not change narrator between plays. A row with no voice id is a
+   real choice — the provider's default — and is different from no row. */
+export function getAutoChoice(articleId, scriptId) {
+  const row = db.prepare('SELECT voice_id, voice_name FROM narration_auto_choices WHERE article_id = ? AND script_id = ?')
+    .get(articleId, scriptId);
+  return row ? { voice_id: row.voice_id, voice_name: row.voice_name } : null;
+}
+
+/** The first choice for a script wins; a racing second one gets the first back. */
+export function saveAutoChoice(articleId, scriptId, voice) {
+  db.prepare('INSERT OR IGNORE INTO narration_auto_choices (article_id, script_id, voice_id, voice_name) VALUES (?, ?, ?, ?)')
+    .run(articleId, scriptId, voice?.voice_id ?? null, voice?.voice_name ?? null);
+  return getAutoChoice(articleId, scriptId);
+}
+
+/* The voices this library has heard lately, so automatic choices spread across
+   the catalogue rather than settling on one narrator. */
+export function recentNarrationVoices(limit = 6) {
+  return db.prepare(`SELECT voice_id FROM narration_variants WHERE voice_id IS NOT NULL
+    GROUP BY voice_id ORDER BY MAX(last_used_at) DESC LIMIT ?`).all(limit).map(row => row.voice_id);
+}
+
+// ── the voice catalogue ──
+
+export function loadCatalogue(language) {
+  const row = db.prepare('SELECT fetched_at, payload FROM narration_voice_catalogue WHERE language = ?').get(language);
+  return row ? { fetched_at: row.fetched_at, voices: safeJson(row.payload, []) } : null;
+}
+
+export function saveCatalogue(language, voices, fetchedAt = now()) {
+  db.prepare(`INSERT INTO narration_voice_catalogue (language, fetched_at, payload) VALUES (?, ?, ?)
+    ON CONFLICT(language) DO UPDATE SET fetched_at = excluded.fetched_at, payload = excluded.payload`)
+    .run(language, fetchedAt, JSON.stringify(voices));
+}
+
+// ── clearing ──
+
+/* Everything spoken for one article goes; the bookmark goes with it because it
+   names passages that no longer exist. The reader's voice choice stays. */
+export function deleteNarrationData(articleId) {
+  transaction(() => {
+    db.prepare('DELETE FROM narration_variants WHERE article_id = ?').run(articleId);
+    db.prepare('DELETE FROM narration_auto_choices WHERE article_id = ?').run(articleId);
+    db.prepare('DELETE FROM narration_segments WHERE article_id = ?').run(articleId);
+    db.prepare('DELETE FROM narrations WHERE article_id = ?').run(articleId);
+    db.prepare(`UPDATE articles SET audio_bookmark = NULL, audio_bookmark_version = audio_bookmark_version + 1,
+      audio_pos = 0 WHERE id = ?`).run(articleId);
+  });
+}
+
+// ── the old format ──
+// Kept only until each article's old bookmark has been converted.
+
+export function getLegacyNarration(articleId) {
   const row = db.prepare('SELECT * FROM narrations WHERE article_id = ?').get(articleId);
   if (!row) return null;
   return { ...row, direction: safeJson(row.direction, {}), script: safeJson(row.script, { segments: [] }) };
 }
 
-export function saveNarration(articleId, narration) {
-  db.prepare(`
-    INSERT INTO narrations (article_id, content_hash, language, voice_id, voice_name, tone, reason,
-      source, direction, script, format, created_at, played_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), NULL)
-    ON CONFLICT(article_id) DO UPDATE SET
-      content_hash=excluded.content_hash, language=excluded.language, voice_id=excluded.voice_id,
-      voice_name=excluded.voice_name, tone=excluded.tone, reason=excluded.reason, source=excluded.source,
-      direction=excluded.direction, script=excluded.script, format=excluded.format,
-      created_at=excluded.created_at, played_at=NULL
-  `).run(articleId, narration.content_hash, narration.language, narration.voice_id, narration.voice_name,
-    narration.tone, narration.reason, narration.source,
-    JSON.stringify(narration.direction || {}), JSON.stringify(narration.script || {}), narration.format || 'mp3');
-  return getNarration(articleId);
+export function legacyDurations(articleId) {
+  const rows = db.prepare('SELECT seq, duration FROM narration_segments WHERE article_id = ?').all(articleId);
+  return new Map(rows.map(row => [row.seq, row.duration]));
 }
 
-export function deleteNarration(articleId) {
-  db.prepare('DELETE FROM narration_segments WHERE article_id = ?').run(articleId);
-  db.prepare('DELETE FROM narrations WHERE article_id = ?').run(articleId);
+/* One step: the converted bookmark (if any) is saved and the old narration and
+   its audio are gone together, so the conversion never runs twice. A bookmark
+   saved meanwhile by a newer client is left alone. */
+export function finishLegacyConversion(articleId, bookmark) {
+  transaction(() => {
+    if (bookmark) {
+      db.prepare(`UPDATE articles SET audio_bookmark = ?, audio_bookmark_version = audio_bookmark_version + 1
+        WHERE id = ? AND audio_bookmark IS NULL`).run(JSON.stringify(bookmark), articleId);
+    }
+    db.prepare('DELETE FROM narration_segments WHERE article_id = ?').run(articleId);
+    db.prepare('DELETE FROM narrations WHERE article_id = ?').run(articleId);
+    db.prepare('UPDATE articles SET audio_pos = 0 WHERE id = ?').run(articleId);
+  });
 }
 
-export function getNarrationSegment(articleId, seq) {
-  return db.prepare('SELECT seq, audio, bytes, duration FROM narration_segments WHERE article_id = ? AND seq = ?')
-    .get(articleId, seq) || null;
-}
-
-export function hasNarrationSegment(articleId, seq) {
-  return Boolean(db.prepare('SELECT 1 FROM narration_segments WHERE article_id = ? AND seq = ?').get(articleId, seq));
-}
-
-export function saveNarrationSegment(articleId, seq, audio, duration) {
-  db.prepare(`
-    INSERT INTO narration_segments (article_id, seq, audio, bytes, duration) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(article_id, seq) DO UPDATE SET
-      audio=excluded.audio, bytes=excluded.bytes, duration=excluded.duration,
-      created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-  `).run(articleId, seq, audio, audio.length, duration);
-}
-
-/** Which segments are already synthesised, and how long each one runs. */
-export function narrationSegmentIndex(articleId) {
-  return db.prepare('SELECT seq, bytes, duration FROM narration_segments WHERE article_id = ? ORDER BY seq')
-    .all(articleId);
-}
-
-export function touchNarration(articleId) {
-  db.prepare("UPDATE narrations SET played_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE article_id = ?")
-    .run(articleId);
-}
-
-/* Audio is by far the largest thing particle stores. Keep the cache under the
-   configured ceiling by dropping the least recently listened-to narrations —
-   the script survives, so they re-synthesise on the next play. */
-export function pruneNarrationAudio(maxBytes, keepArticleId) {
-  const { total } = db.prepare('SELECT COALESCE(SUM(bytes), 0) AS total FROM narration_segments').get();
-  if (total <= maxBytes) return { total, freed: 0 };
-
-  const candidates = db.prepare(`
-    SELECT s.article_id AS article_id, SUM(s.bytes) AS bytes,
-           COALESCE(n.played_at, n.created_at, '') AS used_at
-    FROM narration_segments s LEFT JOIN narrations n ON n.article_id = s.article_id
-    GROUP BY s.article_id ORDER BY used_at ASC
-  `).all();
-
-  let freed = 0;
-  for (const row of candidates) {
-    if (total - freed <= maxBytes) break;
-    if (row.article_id === keepArticleId) continue;
-    db.prepare('DELETE FROM narration_segments WHERE article_id = ?').run(row.article_id);
-    freed += row.bytes;
-  }
-  return { total: total - freed, freed };
-}
-
-/* The voices this library has heard lately. Casting uses it to stop reaching
-   for the same narrator every time: the catalogue has a handful of voices that
-   fit almost any article, and without this one of them reads everything. */
-export function recentNarrationVoices(limit = 6) {
-  return db.prepare(`
-    SELECT voice_id FROM narrations
-    WHERE voice_id IS NOT NULL
-    ORDER BY COALESCE(played_at, created_at) DESC
-    LIMIT ?
-  `).all(limit).map(row => row.voice_id);
-}
-
-export function narrationCacheBytes() {
-  return db.prepare('SELECT COALESCE(SUM(bytes), 0) AS total FROM narration_segments').get().total;
+export function hasLegacyNarration(articleId) {
+  const row = db.prepare('SELECT audio_pos FROM articles WHERE id = ?').get(articleId);
+  if (!row) return false;
+  return row.audio_pos > 0 || Boolean(db.prepare('SELECT 1 FROM narrations WHERE article_id = ?').get(articleId));
 }
