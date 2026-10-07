@@ -1,3 +1,8 @@
+## 1.4.0 — 2026-10-08
+
+- feat: tts upgrades
+- status: 2026-10-06
+
 ## Unreleased — narration
 
 - feat: a default voice for the library, chosen in settings from the whole
