@@ -32,4 +32,4 @@ download of narrated articles, and many playback fixes (see `CHANGELOG.md`). No 
 ## Loose ends
 - `CHANGELOG.md` keeps an "Unreleased — narration" heading below 1.4.0 for changes that
   shipped in 1.4.0 (unverified whether intended).
-- One status-only commit not pushed. Working tree clean.
+- Status-only commits not pushed. Working tree clean.
