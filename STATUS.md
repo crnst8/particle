@@ -1,5 +1,6 @@
 ---
 summary: Self-hosted read-later app: URL to article extraction (Readability/PDF/OCR) into a searchable SQLite library, with optional LLM tagging and TTS.
+brief: Paused. Waiting on your decision about turning it into a hosted service with accounts.
 state: paused
 priority: 2
 updated: 2026-10-06
