@@ -2,10 +2,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 import createDOMPurify from 'dompurify';
 import { assertSafeUrl, safeFetch } from './net.js';
-import {
-  ArchiveChallengeError, fetchAnyMirror, findArchiveSnapshot,
-  parseArchiveUrl, stripArchiveChrome,
-} from './archive-today.js';
+import { changesRequest, removeRuleElements, ruleFor, ruleUrl } from './site-rules.js';
 import { isPdfBytes, looksLikePdfUrl, readPdf } from './pdf.js';
 
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -13,8 +10,8 @@ const GOOGLEBOT_UA = 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compati
 
 // A PDF is downloaded whole before it can be parsed, so it needs a ceiling.
 const PDF_MAX_BYTES = positiveInt(process.env.PDF_MAX_BYTES, 25 * 1024 * 1024);
-// A PDF is a document, not a page: these three fetch it, the rest only serve markup.
-const HTML_ONLY_STRATEGIES = new Set(['amp', 'archive.today']);
+// A PDF is a document, not a page: the AMP edition only ever serves markup.
+const HTML_ONLY_STRATEGIES = new Set(['amp']);
 
 const PAYWALL_MARKERS = [
   'subscribe to continue', 'subscribe to read', 'subscription required', 'to continue reading',
@@ -27,19 +24,13 @@ class FetchError extends Error {
   constructor(message, status) { super(message); this.status = status; }
 }
 
-async function fetchDocument(url, { ua, referer, timeout = 20000 } = {}) {
+async function fetchDocument(url, { ua, referer, headers, timeout = 20000 } = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
     const res = await safeFetch(url, {
       signal: ctrl.signal,
-      headers: {
-        // ua === false → send no User-Agent (web.archive.org 498s spoofed browser UAs)
-        ...(ua === false ? {} : { 'User-Agent': ua || BROWSER_UA }),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        ...(referer ? { 'Referer': referer } : {}),
-      },
+      headers: requestHeaders({ ua, referer, headers }),
     });
     if (!res.ok) throw new FetchError(`HTTP ${res.status}`, res.status);
     const ct = res.headers.get('content-type') || '';
@@ -60,6 +51,23 @@ async function fetchDocument(url, { ua, referer, timeout = 20000 } = {}) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/* Header names are lowercase so a site rule replaces a default rather than
+   sending it twice; a rule's empty value sends no header at all. */
+export function requestHeaders({ ua, referer, headers } = {}) {
+  const out = {
+    // ua === false → send no User-Agent (web.archive.org 498s spoofed browser UAs)
+    ...(ua === false ? {} : { 'user-agent': ua || BROWSER_UA }),
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.9',
+    ...(referer ? { referer } : {}),
+  };
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (value === '') delete out[name];
+    else out[name] = value;
+  }
+  return out;
 }
 
 async function readCapped(res, limit) {
@@ -350,29 +358,21 @@ async function waybackLookup(url) {
 export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
   const url = normalizeUrl(inputUrl);
   await assertSafeUrl(url);
+  const rule = ruleFor(url);
 
-  // A snapshot handed over by the browser (the captcha rescue path) skips the network.
+  // Page source handed over by the browser (the rescue path) skips the network.
   if (html) return extractFromHtml(url, html, sourceUrl);
 
-  const pasted = parseArchiveUrl(inputUrl);
   const attempts = [];
   let best = null;      // best failed attempt, kept as fallback content
-  let challenge = null; // archive.today captcha a human could clear for us
   let ampUrl = null;
 
-  const archiveAttempt = async (snapshotUrl) => {
-    const snapshot = await fetchAnyMirror(snapshotUrl, { userAgent: BROWSER_UA });
-    return { ...snapshot, preclean: stripArchiveChrome };
-  };
-
-  // A short-code snapshot (/kSJh2) names no origin site, so the mirrors are the
-  // only place to ask — hitting example.com's strategies would just be archive.is again.
-  const archiveOnly = Boolean(pasted && !pasted.originalUrl);
-  const strategies = archiveOnly ? [
-    { name: 'archive.today', run: () => archiveAttempt(pasted.snapshotUrl) },
-  ] : [
-    // A pasted archive.is link is an explicit request: honour it before anything else.
-    ...(pasted ? [{ name: 'archive.today', run: () => archiveAttempt(pasted.snapshotUrl) }] : []),
+  const strategies = [
+    // A site with its own rule is a site whose way in is known: try that first.
+    ...(changesRequest(rule) ? [{
+      name: 'site rules',
+      run: () => fetchDocument(ruleUrl(url, rule), { headers: rule.headers }),
+    }] : []),
     { name: 'direct', run: () => fetchDocument(url) },
     { name: 'googlebot', run: () => fetchDocument(url, { ua: GOOGLEBOT_UA, referer: 'https://www.google.com/' }) },
     {
@@ -395,22 +395,17 @@ export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
         }
       },
     },
-    ...(pasted ? [] : [{
-      name: 'archive.today',
-      run: async () => {
-        const snapshotUrl = await findArchiveSnapshot(url);
-        if (!snapshotUrl) throw new FetchError('no archive.today snapshot');
-        return archiveAttempt(snapshotUrl);
-      },
-    }]),
   ];
 
+  // The elements a rule removes are the paywall and its furniture, which are
+  // the same whichever way the page arrived — a Wayback capture included.
+  const preclean = rule?.remove.length ? dom => removeRuleElements(dom, rule) : undefined;
   let isPdf = looksLikePdfUrl(url);
 
   for (const strat of strategies) {
     if (isPdf && HTML_ONLY_STRATEGIES.has(strat.name)) continue;
     try {
-      const { html: body, pdf, finalUrl, preclean } = await strat.run();
+      const { html: body, pdf, finalUrl } = await strat.run();
       const base = strat.name === 'wayback' ? url : finalUrl;
       if (pdf) isPdf = true;
       const attempt = pdf
@@ -421,13 +416,11 @@ export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
       }
       if (attempt.ok) {
         attempt.result.url = url;
-        if (archiveOnly) applyCapturedOrigin(attempt.result, attempt.meta, finalUrl);
         return attempt.result;
       }
       attempts.push(`${strat.name}: ${attempt.reason}`);
       if (attempt.result && (!best || attempt.result.word_count > best.word_count)) best = attempt.result;
     } catch (err) {
-      if (err instanceof ArchiveChallengeError) challenge = archiveChallenge(err, url);
       attempts.push(`${strat.name}: ${err.message}`);
     }
   }
@@ -437,66 +430,42 @@ export async function extractArticle(inputUrl, { html, sourceUrl } = {}) {
     best.url = url;
     best.quality = 'partial';
     best.quality_note = attempts.join('; ');
-    if (challenge) best.challenge = challenge;
     return best;
   }
   const err = new Error('Could not extract article. ' + attempts.join('; '));
   err.attempts = attempts;
-  if (challenge) {
-    err.challenge = challenge;
-    err.statusCode = 428; // Precondition Required — a human has to clear the captcha
-  }
   throw err;
 }
 
-/* A capture reached by short code is still an article on some other site. Move
-   it back under that URL so the library dedupes it and "view original" works. */
-function applyCapturedOrigin(result, meta, snapshotUrl) {
-  const original = parseArchiveUrl(snapshotUrl)?.originalUrl
-    || (meta?.ogUrl && !parseArchiveUrl(meta.ogUrl) ? absolute(meta.ogUrl) : null)
-    || (meta?.canonical && !parseArchiveUrl(meta.canonical) ? absolute(meta.canonical) : null);
-  if (!original) return result;
-  result.url = original;
-  result.canonical_url = original;
-  result.site_name = result.site_name && !/^archive\./.test(result.site_name)
-    ? result.site_name
-    : new URL(original).hostname.replace(/^www\./, '');
-  return result;
-}
-
-function absolute(value) {
-  try { return new URL(value).href; } catch { return null; }
-}
-
-function archiveChallenge(error, url) {
-  return {
-    provider: 'archive.today',
-    snapshot_url: error.challengeUrl,
-    original_url: url,
-    status: error.status || null,
-  };
-}
-
-/* Parse HTML the caller already holds — a snapshot the browser fetched, or page
-   source a reader pasted in after clearing a captcha by hand. */
+/* Parse HTML the caller already holds — page source the bookmarklet sent from
+   the reader's own browser tab, or source or text the reader pasted. */
 export function extractFromHtml(url, source, sourceUrl) {
-  const archive = sourceUrl ? parseArchiveUrl(sourceUrl) : null;
-  const base = sourceUrl || url;
-  const method = archive ? 'archive.today (browser)' : 'browser';
+  const base = safeBase(sourceUrl) || url;
+  const method = 'browser';
   const html = looksLikeHtml(source) ? String(source) : plainTextToHtml(source);
-  const attempt = parseAttempt(html, base, method, { preclean: archive ? stripArchiveChrome : undefined });
+  const rule = ruleFor(base) || ruleFor(url);
+  const preclean = rule?.remove.length ? dom => removeRuleElements(dom, rule) : undefined;
+  const attempt = parseAttempt(html, base, method, { preclean });
   if (!attempt.result) throw new Error(`Could not read that page source: ${attempt.reason}`);
 
   const result = attempt.result;
   result.url = url;
   result.canonical_url = url;
-  // A capture reached by short code belongs to the site it captured, not to archive.today.
-  if (parseArchiveUrl(url)) applyCapturedOrigin(result, attempt.meta, sourceUrl || url);
   if (!attempt.ok) {
     result.quality = 'partial';
     result.quality_note = `${method}: ${attempt.reason}`;
   }
   return result;
+}
+
+// The tab's address is only a base for relative links; anything else is ignored.
+function safeBase(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return /^https?:$/.test(url.protocol) ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 function looksLikeHtml(source) {
@@ -558,10 +527,7 @@ export function normalizeUrl(input) {
   let u = String(input || '').trim();
   if (!u) throw new Error('Empty URL');
   if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
-  // An archive.today link identifies the article it captured, so the library
-  // dedupes a pasted snapshot against the original story.
-  u = parseArchiveUrl(u)?.originalUrl || u;
-  const url = new URL(u);
+  const url = new URL(archivedOriginal(u));
   if (!/^https?:$/.test(url.protocol)) throw new Error('Only http(s) URLs supported');
   // strip common tracking params
   for (const p of [...url.searchParams.keys()]) {
@@ -569,6 +535,25 @@ export function normalizeUrl(input) {
   }
   url.hash = '';
   return url.href;
+}
+
+/* An archive.today link (archive.is, .ph, .md …) names the article it captured
+   in its path, and the article itself is what particle reads and files — the
+   mirrors answer server fetches with a captcha. A short-code link names no
+   article, so there is nothing to fetch in its place. */
+const ARCHIVE_HOSTS = new Set(['archive.today', 'archive.ph', 'archive.is', 'archive.md', 'archive.li',
+  'archive.vn', 'archive.fo']);
+const EMBEDDED_URL = /(?:^|\/)(https?:(?:\/\/|%2f%2f).+)$/i;
+
+export function archivedOriginal(input) {
+  let url;
+  try { url = new URL(input); } catch { return input; }
+  if (!ARCHIVE_HOSTS.has(url.hostname.toLowerCase().replace(/^www\./, ''))) return input;
+  const embedded = `${url.pathname}${url.search}${url.hash}`.match(EMBEDDED_URL);
+  if (embedded) {
+    try { return new URL(decodeURIComponent(embedded[1])).href; } catch { /* not a URL after all */ }
+  }
+  throw new Error('that archive link does not name the article it captured; paste the article\'s own address');
 }
 
 export { BROWSER_UA };

@@ -74,11 +74,12 @@ npm start
 - Extracts article content using Mozilla Readability.
 - Sanitises extracted content with DOMPurify.
 - Uses multiple fallback methods when standard extraction fails:
+  - Site rules — per-publication headers, URL changes and paywall elements
+    (see below)
   - Direct page fetch
   - Googlebot user-agent
   - AMP version
   - Wayback Machine
-  - archive.today (archive.is / .ph / .md and the other mirrors)
 - Keeps the longest available version if all sources are truncated.
 - Flags incomplete articles as **partial**.
 - Supports one-click re-extraction.
@@ -179,7 +180,7 @@ are looked up at all.
 **If the link is found but the page will not open** — a hard paywall, a DOI
 landing page — the article is saved as a *link*: its real title, byline and
 publication from the picture, marked `link` in the list, with the same "try
-again / try archive.today" recovery a partial extraction gets.
+again / send from browser" recovery a partial extraction gets.
 
 Without `LLM_API_KEY` this falls back to OCR, which reads the headline and
 little else: the small grey type carrying the domain is exactly what Tesseract
@@ -194,35 +195,66 @@ key unset and stay on local OCR. Nothing is written to disk at any point, the
 library stores the article and not the picture, and the resolvers afterwards
 send only a title — never the image — to the archives they ask.
 
-### archive.today snapshots
-- Paste an `archive.is/…` link and particle reads that capture, filing it under
-  the original article's URL so it dedupes against the story itself.
-- Otherwise the mirrors are consulted automatically when every other route is
-  paywalled, using the memento timemap to find the newest capture.
-- The archive.today wrapper is stripped and images are pointed back at their
-  original hosts before the page reaches Readability.
+### Site rules
+Some publications open up to a particular request: a Googlebot user agent with a
+consent cookie, a referrer from `t.co`, the AMP edition. Others serve the whole
+article behind an overlay that only has to be taken out. A site rule records
+that for one publication, and particle tries it before the generic strategies.
 
-### When a snapshot cannot be fetched
-The mirrors rate-limit by IP, gate on a captcha cookie, and do not send CORS
-headers on a served snapshot. Every mirror is tried, but they share one backend,
-so a blocked address stays blocked. Particle then tries the fetch from your
-browser, and if that fails too, opens a panel:
+The idea and the starting set come from
+[Periscope](https://github.com/reynaldichernando/periscope), which applies the
+[Ladder](https://github.com/everywall/ladder-rules) ruleset (MIT) through a
+fetch proxy. particle's server is the proxy, so the headers go on its own
+request. Ladder removes overlays with a script once the page loads; particle
+runs no page scripts, so the same selectors are removed before Readability
+reads the page — on every strategy's copy, a Wayback capture included.
 
-1. **open snapshot** in a new tab, wait for the article, solve a captcha if one
-   appears.
+The built-in rules live in [`server/site-rules.js`](server/site-rules.js). To
+add or override sites without editing it, point `SITE_RULES` at a JSON file:
+
+```json
+[
+  {
+    "domains": ["example.com"],
+    "paths": ["/news"],
+    "headers": { "user-agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                 "referer": "https://www.google.com/", "cookie": "" },
+    "query": { "amp": "1" },
+    "remove": [".paywall", "div[class^=\"MessageBanner\"]"]
+  }
+]
+```
+
+`domains` ignore `www.` and match subdomains; `paths` are prefixes; a header
+with an empty value is not sent; `remove` takes CSS selectors. Your rules are
+checked first and the first match wins. A file that does not parse is reported
+in the log and skipped.
+
+### archive.today links
+Paste an `archive.is/…`, `archive.ph/…` or `archive.md/…` link and particle
+reads the article it captured, from that article's own address, and files it
+there so it dedupes against the story itself. The mirrors answer server fetches
+with a captcha, so particle does not fetch from them. A short-code link
+(`archive.is/kSJh2`) names no article and is refused with a message asking for
+the article's own address.
+
+### When the server cannot read a page
+A login, a subscription or a bot check stops the server where your own browser
+gets through. After a failed save, or on an article saved *partial* or as a
+*link*, **send from browser** opens a panel:
+
+1. **open the page** in a new tab, wait for the article, sign in if you
+   subscribe.
 2. **send page to particle**, a bookmarklet the panel generates. Drag it to the
    bookmarks bar once, then one click per rescue.
 3. Or paste into the panel: page source (view source, select all, copy), or the
    plain article text.
 
-The page source has to come out of that tab because the captcha is cleared
-against a cookie only that tab holds; a cross-origin fetch is uncredentialed and
-gets the captcha again. The bookmarklet posts back on a single-use ticket that
-expires in 15 minutes.
-
-The source is parsed server-side and saved like any other article. A capture
-reached by short code (`archive.is/kSJh2`) is filed under the story's own URL,
-and an article already saved as *partial* is rewritten in place.
+The page source has to come out of that tab because only that tab holds your
+cookies for the site. The bookmarklet posts back on a single-use ticket that
+expires in 15 minutes. The source is parsed server-side, with the site's rule
+applied, and saved like any other article; an article already saved as
+*partial* is rewritten in place.
 
 > The bookmarklet is desktop only, and browsers block it from an HTTPS page to a
 > plain-HTTP particle (Chrome and Firefox exempt `localhost`; Safari does not).
@@ -369,9 +401,8 @@ next to the compose file — see [`.env.example`](.env.example).
 | `PARTICLE_BASE` | unset | Mount below a path such as `/particle` |
 | `ALLOW_PRIVATE_HOSTS` | `0` | Set to `1` only when you intentionally save pages from a private network |
 | `IMAGE_MAX_BYTES` | `8388608` | Maximum image-proxy response size |
-| `SNAPSHOT_MAX_BYTES` | `8388608` | Maximum page source accepted from the browser during an archive.today rescue |
-| `ARCHIVE_TODAY_HOSTS` | mirror list | Comma-separated archive.today mirrors to try, in order |
-| `ARCHIVE_TODAY_COOKIE` | unset | Cookie header sent to archive.today, if you have a session that clears the captcha server-side |
+| `SNAPSHOT_MAX_BYTES` | `8388608` | Maximum page source accepted from your browser when the server cannot read a page |
+| `SITE_RULES` | unset | Path to a JSON file of extra site rules, checked before the built-in ones |
 | `LLM_API_KEY` | unset | API key for the optional tagging/quality pass. Unset = feature off |
 | `LLM_API_URL` | OpenCode Zen | Any OpenAI-compatible `/chat/completions` URL — Ollama, OpenRouter, whatever you run |
 | `LLM_MODEL` | `deepseek-v4-flash` | Model name for the above |

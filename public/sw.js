@@ -5,7 +5,7 @@ const at = path => `${BASE}${path}` || '/';
    cache this worker owns carries its base in the name, and it only ever
    deletes its own. */
 const SCOPE = BASE || '/';
-const SHELL_VERSION = 11;
+const SHELL_VERSION = 12;
 const SHELL = `particle-shell-v${SHELL_VERSION}:${SCOPE}`;
 const RUNTIME = `particle-runtime-v${SHELL_VERSION}:${SCOPE}`;
 // Narration audio is the page's to keep (narration-cache.js), versioned on its own.

@@ -1,7 +1,8 @@
 /* Short-lived tickets for page source that arrives from somewhere other than
    this app's own origin — the "send page to particle" bookmarklet, clicked on
-   an archive.today tab after a human cleared the captcha. The token is the
-   whole authorisation: unguessable, single use, and it expires. */
+   the article's own tab in the reader's browser, where the page opened when
+   the server's fetch did not. The token is the whole authorisation:
+   unguessable, single use, and it expires. */
 import { randomBytes } from 'node:crypto';
 
 const TTL_MS = 15 * 60 * 1000;

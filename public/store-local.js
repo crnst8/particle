@@ -73,7 +73,7 @@
         return evictedTitle ? { ...article, evicted_title: evictedTitle } : article;
       },
 
-      // An article the server already extracted (the captcha handoff delivered it
+      // An article the server already extracted (the browser handoff delivered it
       // to the server, not to this tab) still has to be filed in this library.
       async adopt(extracted) {
         await ready;
@@ -258,7 +258,7 @@
     }
   };
 
-  // Page source the browser fetched itself — the archive.today captcha rescue.
+  // Page source the reader sent from their own browser — the rescue path.
   function sourceBody(source) {
     return {
       ...(source?.html ? { html: source.html, source_url: source.sourceUrl || null } : {}),

@@ -381,10 +381,10 @@ import { createAudioStore } from './narration-cache.js';
           : `saved “${a.title}”`;
       // an article already in the library has nothing to announce
       if (!a.duplicate) celebrateSave(a.id);
-      if (a.challenge) {
+      if (!a.duplicate && a.quality === 'partial') {
         offerRescue({
-          url: a.url, articleId: a.id, challenge: a.challenge, mount: $('rescue'),
-          head: 'partial extraction. archive.today may hold a fuller snapshot.',
+          url: a.url, articleId: a.id, mount: $('rescue'),
+          head: 'partial extraction. your browser may open the full page.',
           onDone: saved => {
             saveStatus.textContent = `re-extracted “${saved.title}”`;
             celebrateSave(saved.id);
@@ -412,24 +412,18 @@ import { createAudioStore } from './narration-cache.js';
       }
       saveStatus.classList.remove('ok');
       saveStatus.classList.add('error');
-      // 428 means a snapshot is known and blocked, so go straight at it. Any other
-      // failed extraction just gets the offer; the snapshot may not exist.
-      const rescuable = e.status === 428 || e.status === 422;
-      if (rescuable) {
+      // The server could not read the page; the reader's own browser often can.
+      if (e.status === 422) {
         urlInput.value = '';
-        const target = e.data?.challenge?.original_url || url;
-        const onDone = saved => {
-          saveStatus.classList.remove('error');
-          saveStatus.textContent = `saved “${saved.title}” from archive.today`;
-          celebrateSave(saved.id);
-          refresh();
-        };
-        if (e.data?.challenge) {
-          saveStatus.textContent = 'source blocked; trying archive.today';
-          startRescue({ url: target, challenge: e.data.challenge, mount: $('rescue'), onDone });
-        } else {
-          offerRescue({ url: target, mount: $('rescue'), onDone });
-        }
+        offerRescue({
+          url, mount: $('rescue'),
+          onDone: saved => {
+            saveStatus.classList.remove('error');
+            saveStatus.textContent = `saved “${saved.title}” from your browser`;
+            celebrateSave(saved.id);
+            refresh();
+          },
+        });
       }
     } finally {
       saveBtn.disabled = false;
@@ -732,13 +726,13 @@ import { createAudioStore } from './narration-cache.js';
     if (a.quality === 'link' || a.quality === 'partial' || a.quality === 'stub') {
       note.hidden = false;
       // A link saved because the page would not open takes the same two ways
-      // out as a partial one: ask the site again, or ask archive.today.
+      // out as a partial one: ask the site again, or send it from the browser.
       note.innerHTML = (a.quality === 'link'
         ? `particle could not read this page, so only the link is saved${a.quality_note ? ' — ' + esc(a.quality_note) : ''}.`
         : `this extraction may be incomplete${a.quality_note ? ' — ' + esc(a.quality_note) : ''}.`)
-        + ` <button id="note-refetch">try again</button> <button id="note-archive">try archive.today</button>`;
+        + ` <button id="note-refetch">try again</button> <button id="note-browser">send from browser</button>`;
       note.querySelector('#note-refetch').addEventListener('click', () => doRefetch(a.id));
-      note.querySelector('#note-archive').addEventListener('click', () => startRescue({
+      note.querySelector('#note-browser').addEventListener('click', () => renderHandoff({
         url: a.url, articleId: a.id, mount: $('reader-rescue'), onDone: () => openReader(a.id),
       }));
     } else {
@@ -1158,48 +1152,11 @@ import { createAudioStore } from './narration-cache.js';
     }
   });
 
-  // ── archive.today rescue ─────────────────────────────────────────────────
-  // The mirrors rate-limit by IP, gate on a captcha cookie and do not send CORS
-  // headers on a served snapshot, so neither the server nor this page can be
-  // relied on to read one. Both are tried; the page source is otherwise supplied
-  // from the archive.today tab itself, by bookmarklet or by paste.
-  const CHALLENGED = /<title>\s*archive\.[a-z]{2,6}\s*<\/title>/i;
+  // ── browser rescue ───────────────────────────────────────────────────────
+  // When the server cannot read a page — a login, a subscription, a bot check —
+  // the reader's own browser usually can. The page source comes back from that
+  // tab by bookmarklet, on a single-use ticket, or by paste.
   const polling = new Set();
-
-  async function startRescue({ url, articleId, challenge, mount, onDone }) {
-    stopAllPolling();
-    const session = { url, articleId, mount, onDone, snapshotUrl: challenge?.snapshot_url || '' };
-    mount.hidden = false;
-    if (!session.snapshotUrl) {
-      say(mount, 'locating snapshot…');
-      try {
-        const found = await fetchJson(`/api/archive-snapshot?url=${encodeURIComponent(url)}`);
-        session.snapshotUrl = found.snapshot_url;
-      } catch (e) {
-        return say(mount, e.message, 'error');
-      }
-    }
-    return tryRescue(session, { allowServerRetry: false });
-  }
-
-  async function tryRescue(session, { allowServerRetry }) {
-    const { mount } = session;
-    say(mount, 'fetching snapshot…');
-    const page = await fetchSnapshot(session.snapshotUrl);
-
-    if (!page && allowServerRetry) {
-      say(mount, 'retrying from the server…');
-      try { return await finishRescue(session, null); } catch { /* still blocked */ }
-    }
-    if (!page) return renderChallenge(session);
-
-    say(mount, 'parsing snapshot…');
-    try {
-      await finishRescue(session, { html: page.html, sourceUrl: page.finalUrl });
-    } catch (e) {
-      renderChallenge(session, e.message);
-    }
-  }
 
   async function finishRescue(session, source) {
     const saved = session.articleId
@@ -1211,22 +1168,9 @@ import { createAudioStore } from './narration-cache.js';
     return saved;
   }
 
-  async function fetchSnapshot(snapshotUrl) {
-    try {
-      const res = await fetch(snapshotUrl, { credentials: 'omit', redirect: 'follow' });
-      const html = await res.text();
-      if (!res.ok || CHALLENGED.test(html.slice(0, 4000))) return null;
-      return { html, finalUrl: res.url || snapshotUrl };
-    } catch {
-      return null; // CORS or network: fall back to supplying the source by hand
-    }
-  }
-
-  /* Neither fetch could read the snapshot. The page source has to come out of
-     the archive.today tab itself: by bookmarklet, or pasted. */
-  async function renderChallenge(session, error) {
+  async function renderHandoff(session, error) {
     const { mount } = session;
-    stopPolling(session);
+    stopAllPolling();
     mount.hidden = false;
     mount.innerHTML = '<p class="rescue-head">preparing handoff…</p>';
 
@@ -1236,11 +1180,11 @@ import { createAudioStore } from './narration-cache.js';
     } catch { /* no ticket: pasting still works */ }
 
     mount.innerHTML = `
-      <p class="rescue-head">can't fetch this snapshot. supply the page source:</p>
+      <p class="rescue-head">particle can't read this page. send it from your browser:</p>
       ${error ? `<p class="rescue-error">${esc(error)}</p>` : ''}
       <ol class="rescue-steps">
-        <li><a class="rescue-link" href="${esc(session.snapshotUrl)}" target="_blank" rel="noopener">open snapshot &#8599;</a></li>
-        <li>wait for the article. solve the captcha if one appears</li>
+        <li><a class="rescue-link" href="${esc(session.url)}" target="_blank" rel="noopener">open the page &#8599;</a></li>
+        <li>wait for the article. sign in if you subscribe</li>
         ${ticket ? `<li>click <a class="rescue-link rescue-bookmarklet" href="${bookmarkletHref(ticket)}">send page to particle</a>
           <span class="rescue-hint">(drag to bookmarks bar first)</span></li>` : ''}
       </ol>
@@ -1256,14 +1200,20 @@ import { createAudioStore } from './narration-cache.js';
       <p class="rescue-note">Bookmarklet: desktop only, and blocked from an https page to a
         plain http particle. Paste always works; on mobile, copy the article text.</p>`;
 
-    mount.querySelector('.rescue-go').addEventListener('click', () => {
-      tryRescue(session, { allowServerRetry: true });
+    mount.querySelector('.rescue-go').addEventListener('click', async () => {
+      stopPolling(session);
+      say(mount, 'retrying from the server…');
+      try {
+        await finishRescue(session, null);
+      } catch (e) {
+        renderHandoff(session, e.message);
+      }
     });
     mount.querySelector('.rescue-bookmarklet')?.addEventListener('click', (ev) => {
       // Clicked here it would only ever read particle's own page.
       ev.preventDefault();
       const wait = mount.querySelector('.rescue-wait');
-      if (wait) wait.textContent = 'drag it to the bookmarks bar, then click it on the archive.today tab';
+      if (wait) wait.textContent = "drag it to the bookmarks bar, then click it on the article's tab";
     });
     mount.querySelector('.rescue-manual').addEventListener('submit', async (ev) => {
       ev.preventDefault();
@@ -1272,9 +1222,9 @@ import { createAudioStore } from './narration-cache.js';
       stopPolling(session);
       say(mount, 'parsing source…');
       try {
-        await finishRescue(session, { html, sourceUrl: session.snapshotUrl });
+        await finishRescue(session, { html, sourceUrl: session.url });
       } catch (e) {
-        renderChallenge(session, e.message);
+        renderHandoff(session, e.message);
       }
     });
     if (ticket) pollTicket(session, ticket.token);
@@ -1319,12 +1269,13 @@ import { createAudioStore } from './narration-cache.js';
     for (const session of [...polling]) stopPolling(session);
   }
 
-  function offerRescue({ url, articleId, challenge, mount, onDone, head }) {
+  function offerRescue({ url, articleId, mount, onDone, head }) {
+    stopAllPolling();
     mount.hidden = false;
-    mount.innerHTML = `<p class="rescue-head">${esc(head || 'archive.today may hold a snapshot of this page.')}</p>
-      <p class="rescue-alt"><button class="rescue-submit" type="button">try archive.today</button></p>`;
+    mount.innerHTML = `<p class="rescue-head">${esc(head || 'your browser may open this page.')}</p>
+      <p class="rescue-alt"><button class="rescue-submit" type="button">send from browser</button></p>`;
     mount.querySelector('.rescue-submit').addEventListener('click', () => {
-      startRescue({ url, articleId, challenge, mount, onDone });
+      renderHandoff({ url, articleId, mount, onDone });
     });
   }
 
