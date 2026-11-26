@@ -1,3 +1,17 @@
+## 1.5.0 — 2026-11-26
+
+- feat: site rules, after Periscope and the Ladder ruleset. Per-site request
+  headers, query changes and paywall elements to remove, tried before the
+  generic strategies. Built in for NYT/Time, Condé Nast titles, the
+  Washington Post, USA Today, Medium, Tagesspiegel, NZZ, De Morgen, the FT and
+  the Toronto Star group. `SITE_RULES` points at a JSON file of your own
+- change: archive.today is no longer fetched; it answers servers with a
+  captcha. A pasted archive link is read from the article's own address, and a
+  short-code link is refused
+- change: the rescue panel is now "send from browser": open the original page,
+  then send it back by bookmarklet or paste. `ARCHIVE_TODAY_HOSTS`,
+  `ARCHIVE_TODAY_COOKIE` and `GET /api/archive-snapshot` are gone
+
 ## 1.4.0 — 2026-10-08
 
 - feat: tts upgrades
